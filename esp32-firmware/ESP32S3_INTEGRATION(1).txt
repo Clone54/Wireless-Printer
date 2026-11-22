@@ -1,0 +1,25 @@
+=== Integrating CloudClient into ESP32S3_PrintServer ===
+
+1. Copy `cloud_client.h` and `cloud_client.cpp` into your Arduino sketch folder:
+   E:\Downloads\ESP32S3_PrintServer-main\ESP32S3_PrintServer-main\ESP32S3_PrintServer\
+
+2. In `config.h`, add your cloud server URL and secret token:
+   #define CLOUD_SERVER_URL  "https://your-app-name.onrender.com"
+   #define CLOUD_PRINT_TOKEN "your-secret-token"
+
+3. In `ESP32S3_PrintServer.ino`:
+   - Near the top includes, add:
+     #include "cloud_client.h"
+   - Under global objects, add:
+     CloudClient cloudClient(usbPrinter);
+   - Inside `setup()` (after `if (wifiMgr.isConnected())`), add:
+     cloudClient.begin(CLOUD_SERVER_URL, CLOUD_PRINT_TOKEN);
+   - Inside `loop()`, add:
+     cloudClient.task();
+
+4. (Optional) In `usb_printer.cpp` inside `_openDevice()`, replace the Brother-only
+   VID/PID check with Epson L3210 so the dashboard shows "Epson EcoTank L3210":
+     if (devDesc->idVendor == 0x04B8 && devDesc->idProduct == 0x1188) {
+       _manufacturer = "Epson";
+       _product = "EcoTank L3210";
+     }
