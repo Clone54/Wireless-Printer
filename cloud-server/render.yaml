@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: epson-l3210-cloud-relay
+    runtime: docker
+    plan: free
+    envVars:
+      - key: PORT
+        value: "3000"
+      - key: PRINT_TOKEN
+        generateValue: true

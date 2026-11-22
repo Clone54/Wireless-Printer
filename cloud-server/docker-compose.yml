@@ -1,0 +1,9 @@
+services:
+  print-relay:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - PRINT_TOKEN=change-this-secret-token
