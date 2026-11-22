@@ -10,6 +10,7 @@ app.set('trust proxy', true);
 
 const PORT = process.env.PORT || 3000;
 const PRINT_TOKEN = process.env.PRINT_TOKEN || 'changeme123';
+const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'firozahmedshoykot44@gmail.com').toLowerCase();
 const PPD_PATH = '/etc/cups/ppd/epson_l3210.ppd';
 const JOBS_DIR = '/tmp/jobs';
 const UPLOADS_DIR = '/tmp/uploads';
@@ -17,9 +18,11 @@ const UPLOADS_DIR = '/tmp/uploads';
 fs.mkdirSync(JOBS_DIR, { recursive: true });
 fs.mkdirSync(UPLOADS_DIR, { recursive: true });
 
-// --- Optional Firebase Firestore Initialization ---
+// --- Firebase Admin (Firestore + Auth Verification) ---
 let db = null;
 let admin = null;
+let webConfig = null;
+
 if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
   try {
     admin = require('firebase-admin');
@@ -28,13 +31,21 @@ if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
       credential: admin.credential.cert(serviceAccount)
     });
     db = admin.firestore();
-    console.log('[Firestore] Connected successfully');
+    console.log('[Firebase] Admin SDK & Firestore connected');
   } catch (err) {
-    console.error('[Firestore] Init failed, falling back to in-memory:', err.message);
+    console.error('[Firebase] Admin init failed:', err.message);
     db = null;
   }
 } else {
-  console.log('[Firestore] FIREBASE_SERVICE_ACCOUNT_JSON not set; using in-memory history');
+  console.log('[Firebase] FIREBASE_SERVICE_ACCOUNT_JSON not set');
+}
+
+if (process.env.FIREBASE_WEB_CONFIG_JSON) {
+  try {
+    webConfig = JSON.parse(process.env.FIREBASE_WEB_CONFIG_JSON);
+  } catch (err) {
+    console.error('[Firebase] Invalid FIREBASE_WEB_CONFIG_JSON:', err.message);
+  }
 }
 
 const upload = multer({
@@ -43,16 +54,42 @@ const upload = multer({
 });
 
 const jobs = [];
-const memoryStats = { totalJobs: 0, totalPages: 0, colorPages: 0, bwPages: 0 };
 let lastEspSeen = 0;
 let espPrinterStatus = 'Unknown';
 
-function requireToken(req, res, next) {
-  const token = req.headers['x-print-token'] || req.query.token || (req.body && req.body.token);
+// ESP32-S3 & Laptop Relay token middleware
+function requireDeviceToken(req, res, next) {
+  const token = req.headers['x-print-token'] || req.query.token;
   if (!token || token !== PRINT_TOKEN) {
-    return res.status(401).json({ error: 'Invalid password (PRINT_TOKEN)' });
+    return res.status(401).json({ error: 'Invalid PRINT_TOKEN' });
   }
   next();
+}
+
+// Google Sign-In Firebase ID Token middleware for web users
+async function requireGoogleUser(req, res, next) {
+  if (!admin) {
+    return res.status(500).json({ error: 'Firebase Admin not configured on server' });
+  }
+  const authHeader = req.headers.authorization || '';
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (!match) {
+    return res.status(401).json({ error: 'Missing Google sign-in token' });
+  }
+  try {
+    const decoded = await admin.auth().verifyIdToken(match[1]);
+    const email = (decoded.email || '').toLowerCase();
+    req.user = {
+      uid: decoded.uid,
+      email,
+      name: decoded.name || email || 'User',
+      picture: decoded.picture || '',
+      isAdmin: email === ADMIN_EMAIL
+    };
+    next();
+  } catch (err) {
+    return res.status(401).json({ error: 'Invalid or expired Google session' });
+  }
 }
 
 function parseDeviceInfo(req) {
@@ -148,12 +185,8 @@ async function countSelectedPages(filePath, ext, pageMode, customPages) {
   const match = info.stdout.toString('utf8').match(/Pages:\s+(\d+)/i);
   const totalPdfPages = match ? Math.max(1, parseInt(match[1], 10)) : 1;
 
-  if (pageMode === 'odd') {
-    return Math.ceil(totalPdfPages / 2);
-  }
-  if (pageMode === 'even') {
-    return Math.max(0, Math.floor(totalPdfPages / 2));
-  }
+  if (pageMode === 'odd') return Math.ceil(totalPdfPages / 2);
+  if (pageMode === 'even') return Math.max(0, Math.floor(totalPdfPages / 2));
   if (pageMode === 'custom' && customPages) {
     const selected = new Set();
     for (const part of customPages.split(',')) {
@@ -171,11 +204,31 @@ async function countSelectedPages(filePath, ext, pageMode, customPages) {
   return totalPdfPages;
 }
 
+async function upsertUserOnLogin(user, devInfo) {
+  if (!db) return;
+  try {
+    await db.collection('users').doc(user.uid).set({
+      uid: user.uid,
+      email: user.email,
+      name: user.name,
+      role: user.isAdmin ? 'admin' : 'user',
+      lastDevice: devInfo.device,
+      lastIp: devInfo.ip,
+      lastSeen: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+  } catch (err) {
+    console.error('[Firestore] Upsert user failed:', err.message);
+  }
+}
+
 async function saveJobToFirestore(job) {
   if (!db) return;
   try {
     await db.collection('print_jobs').doc(job.id).set({
       jobId: job.id,
+      uid: job.uid,
+      userEmail: job.userEmail,
+      userName: job.userName,
       name: job.name,
       source: job.source,
       device: job.device,
@@ -208,13 +261,33 @@ async function updateJobStatusInFirestore(job, ok) {
     });
     if (ok) {
       const inc = admin.firestore.FieldValue.increment;
+      const colorInc = job.colorMode === 'Color' ? job.totalPages : 0;
+      const bwInc = job.colorMode === 'B&W' ? job.totalPages : 0;
+
+      // Global summary
       await db.collection('stats').doc('summary').set({
         totalJobs: inc(1),
         totalPages: inc(job.totalPages),
-        colorPages: inc(job.colorMode === 'Color' ? job.totalPages : 0),
-        bwPages: inc(job.colorMode === 'B&W' ? job.totalPages : 0),
+        colorPages: inc(colorInc),
+        bwPages: inc(bwInc),
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       }, { merge: true });
+
+      // Per-user summary
+      if (job.uid) {
+        await db.collection('users').doc(job.uid).set({
+          uid: job.uid,
+          email: job.userEmail,
+          name: job.userName,
+          totalJobs: inc(1),
+          totalPages: inc(job.totalPages),
+          colorPages: inc(colorInc),
+          bwPages: inc(bwInc),
+          lastDevice: job.device,
+          lastIp: job.ip,
+          lastPrintAt: job.createdAt
+        }, { merge: true });
+      }
     }
   } catch (err) {
     console.error('[Firestore] Update status failed:', err.message);
@@ -223,16 +296,22 @@ async function updateJobStatusInFirestore(job, ok) {
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Verify password (PRINT_TOKEN) for login screen
-app.post('/api/auth', express.json(), (req, res) => {
-  const token = (req.body && req.body.token) || req.headers['x-print-token'] || '';
-  if (!token || token !== PRINT_TOKEN) {
-    return res.status(401).json({ ok: false, error: 'Incorrect password' });
-  }
-  res.json({ ok: true, firestoreEnabled: Boolean(db) });
+// Public endpoint so the frontend can initialize Firebase Google Sign-In
+app.get('/api/public-config', (req, res) => {
+  res.json({
+    firebaseConfig: webConfig,
+    firestoreEnabled: Boolean(db)
+  });
 });
 
-app.post('/api/print-file', upload.single('file'), requireToken, async (req, res) => {
+// Register/sync logged-in Google user and return their role
+app.post('/api/me', requireGoogleUser, async (req, res) => {
+  const devInfo = parseDeviceInfo(req);
+  await upsertUserOnLogin(req.user, devInfo);
+  res.json({ user: req.user });
+});
+
+app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded' });
   }
@@ -267,7 +346,7 @@ app.post('/api/print-file', upload.single('file'), requireToken, async (req, res
   const pagesPerCopy = await countSelectedPages(inputPath, ext, pageMode, customPages);
   if (pagesPerCopy === 0) {
     cleanup();
-    return res.status(400).json({ error: 'No pages matched your selected page filter (e.g. Even pages on a 1-page PDF).' });
+    return res.status(400).json({ error: 'No pages matched your selected page filter.' });
   }
   const totalPages = pagesPerCopy * copies;
   const devInfo = parseDeviceInfo(req);
@@ -280,29 +359,18 @@ app.post('/api/print-file', upload.single('file'), requireToken, async (req, res
     '-o', 'fit-to-page'
   ];
 
-  if (orientation === 'landscape') {
-    cupsOpts.push('-o', 'landscape');
-  }
-  if (pageMode === 'odd') {
-    cupsOpts.push('-o', 'page-set=odd');
-  } else if (pageMode === 'even') {
-    cupsOpts.push('-o', 'page-set=even');
-  } else if (pageMode === 'custom' && customPages) {
-    cupsOpts.push('-o', `page-ranges=${customPages}`);
-  }
+  if (orientation === 'landscape') cupsOpts.push('-o', 'landscape');
+  if (pageMode === 'odd') cupsOpts.push('-o', 'page-set=odd');
+  else if (pageMode === 'even') cupsOpts.push('-o', 'page-set=even');
+  else if (pageMode === 'custom' && customPages) cupsOpts.push('-o', `page-ranges=${customPages}`);
 
   const optsStr = `PageSize=${paper} media=${paper} Ink=${ink} MediaType=${quality} fit-to-page`;
   const envVars = { PPD: PPD_PATH, PRINTER: 'epson_l3210', CUPS_SERVERROOT: '/etc/cups' };
 
   try {
     const a1 = await runFilter('cupsfilter', [
-      '-e',
-      '-p', PPD_PATH,
-      '-d', 'epson_l3210',
-      '-m', 'printer/foo',
-      ...cupsOpts,
-      '-o', `copies=${copies}`,
-      inputPath
+      '-e', '-p', PPD_PATH, '-d', 'epson_l3210', '-m', 'printer/foo',
+      ...cupsOpts, '-o', `copies=${copies}`, inputPath
     ], null, envVars);
 
     let finalBuf = a1.stdout;
@@ -310,10 +378,7 @@ app.post('/api/print-file', upload.single('file'), requireToken, async (req, res
 
     if (!isValidEscpr(finalBuf)) {
       const a2Ras = await runFilter('cupsfilter', [
-        '-p', PPD_PATH,
-        '-m', 'application/vnd.cups-raster',
-        ...cupsOpts,
-        inputPath
+        '-p', PPD_PATH, '-m', 'application/vnd.cups-raster', ...cupsOpts, inputPath
       ], null, envVars);
 
       diagLog += ` | A2-Raster: ${describeHeader(a2Ras.stdout)}`;
@@ -327,14 +392,9 @@ app.post('/api/print-file', upload.single('file'), requireToken, async (req, res
         }
         const gsRas = await runFilter('gs', [
           '-q', '-dNOPAUSE', '-dBATCH', '-dSAFER',
-          '-sDEVICE=cups',
-          '-r360x360',
-          `-sPAPERSIZE=${paper.toLowerCase()}`,
-          '-dcupsColorSpace=1',
-          '-dcupsBitsPerColor=8',
-          '-dcupsColorOrder=0',
-          '-sOutputFile=-',
-          pdfPath
+          '-sDEVICE=cups', '-r360x360', `-sPAPERSIZE=${paper.toLowerCase()}`,
+          '-dcupsColorSpace=1', '-dcupsBitsPerColor=8', '-dcupsColorOrder=0',
+          '-sOutputFile=-', pdfPath
         ], null, envVars);
         if (pdfPath !== inputPath) fs.unlink(pdfPath, () => {});
         rasterBuf = gsRas.stdout;
@@ -345,8 +405,7 @@ app.post('/api/print-file', upload.single('file'), requireToken, async (req, res
         const wrapRes = await runFilter(
           '/usr/lib/cups/filter/epson-escpr-wrapper',
           ['1', 'root', req.file.originalname || 'Job', String(copies), optsStr],
-          rasterBuf,
-          envVars
+          rasterBuf, envVars
         );
         finalBuf = wrapRes.stdout;
         diagLog += ` | Wrapper: ${describeHeader(finalBuf)} err=[${wrapRes.stderr.trim()}]`;
@@ -357,14 +416,15 @@ app.post('/api/print-file', upload.single('file'), requireToken, async (req, res
     console.log('[CUPS Pipeline]', diagLog);
 
     if (!isValidEscpr(finalBuf)) {
-      return res.status(500).json({
-        error: `Safety block (no paper wasted). Diagnostics: ${diagLog}`
-      });
+      return res.status(500).json({ error: `Safety block (no paper wasted). Diagnostics: ${diagLog}` });
     }
 
     fs.writeFileSync(outPath, finalBuf);
     const job = {
       id: jobId,
+      uid: req.user.uid,
+      userEmail: req.user.email,
+      userName: req.user.name,
       name: req.file.originalname || 'Document',
       source: 'Web/Phone',
       device: devInfo.device,
@@ -385,7 +445,7 @@ app.post('/api/print-file', upload.single('file'), requireToken, async (req, res
     };
     jobs.push(job);
     await saveJobToFirestore(job);
-    console.log(`[Queue] Verified ESC/P-R job ${jobId} (${job.name}, ${totalPages}p ${colorMode}, ${devInfo.device})`);
+    console.log(`[Queue] Job ${jobId} by ${req.user.email} (${totalPages}p ${colorMode})`);
     return res.json({ ok: true, job: { id: job.id, name: job.name, size: job.size, totalPages, colorMode, status: job.status } });
   } catch (e) {
     cleanup();
@@ -393,7 +453,8 @@ app.post('/api/print-file', upload.single('file'), requireToken, async (req, res
   }
 });
 
-app.post('/api/print-raw', requireToken, express.raw({ type: '*/*', limit: '50mb' }), async (req, res) => {
+// Laptop Relay (authenticated with PRINT_TOKEN, attributed to admin)
+app.post('/api/print-raw', requireDeviceToken, express.raw({ type: '*/*', limit: '50mb' }), async (req, res) => {
   if (!req.body || req.body.length === 0) {
     return res.status(400).json({ error: 'Empty print payload' });
   }
@@ -408,6 +469,9 @@ app.post('/api/print-raw', requireToken, express.raw({ type: '*/*', limit: '50mb
   const devInfo = parseDeviceInfo(req);
   const job = {
     id: jobId,
+    uid: 'admin_laptop_relay',
+    userEmail: ADMIN_EMAIL,
+    userName: 'Admin (Laptop Relay)',
     name: req.headers['x-job-name'] || `Laptop Job ${jobId}`,
     source: 'Laptop',
     device: devInfo.device,
@@ -428,110 +492,145 @@ app.post('/api/print-raw', requireToken, express.raw({ type: '*/*', limit: '50mb
   };
   jobs.push(job);
   await saveJobToFirestore(job);
-  console.log(`[Queue] Added raw job ${jobId} (${job.size} bytes)`);
   res.json({ ok: true, jobId, size: job.size });
 });
 
-app.get('/api/esp/poll', requireToken, (req, res) => {
+// ESP32-S3 endpoints (authenticated with PRINT_TOKEN)
+app.get('/api/esp/poll', requireDeviceToken, (req, res) => {
   lastEspSeen = Date.now();
   if (req.query.status) {
     espPrinterStatus = String(req.query.status).slice(0, 40);
   }
-
   const nextJob = jobs.find(j => j.status === 'queued');
-  if (!nextJob) {
-    return res.status(204).end();
-  }
-
+  if (!nextJob) return res.status(204).end();
   nextJob.status = 'printing';
   res.json({ id: nextJob.id, size: nextJob.size, name: nextJob.name });
 });
 
-app.get('/api/esp/job/:id', requireToken, (req, res) => {
+app.get('/api/esp/job/:id', requireDeviceToken, (req, res) => {
   const job = jobs.find(j => j.id === req.params.id);
-  if (!job || !fs.existsSync(job.filePath)) {
-    return res.status(404).end();
-  }
+  if (!job || !fs.existsSync(job.filePath)) return res.status(404).end();
   res.setHeader('Content-Type', 'application/octet-stream');
   res.setHeader('Content-Length', job.size);
   fs.createReadStream(job.filePath).pipe(res);
 });
 
-app.post('/api/esp/job/:id/done', requireToken, express.json(), async (req, res) => {
+app.post('/api/esp/job/:id/done', requireDeviceToken, express.json(), async (req, res) => {
   const job = jobs.find(j => j.id === req.params.id);
   if (!job) return res.status(404).json({ error: 'Job not found' });
-
   const ok = !req.body || req.body.ok !== false;
   job.status = ok ? 'completed' : 'failed';
-  if (fs.existsSync(job.filePath)) {
-    fs.unlink(job.filePath, () => {});
-  }
-  if (ok) {
-    memoryStats.totalJobs += 1;
-    memoryStats.totalPages += job.totalPages;
-    if (job.colorMode === 'Color') memoryStats.colorPages += job.totalPages;
-    else memoryStats.bwPages += job.totalPages;
-  }
+  if (fs.existsSync(job.filePath)) fs.unlink(job.filePath, () => {});
   await updateJobStatusInFirestore(job, ok);
-  console.log(`[Queue] Job ${job.id} -> ${job.status}`);
   res.json({ ok: true });
 });
 
-app.get('/api/status', requireToken, async (req, res) => {
+// Dashboard status: strictly scoped by user role (Admin sees all; regular users see ONLY their own)
+app.get('/api/status', requireGoogleUser, async (req, res) => {
   const espOnline = (Date.now() - lastEspSeen) < 15000;
-  let summary = { ...memoryStats };
-  let recentJobs = jobs.slice(-20).reverse().map(j => ({
-    id: j.id,
-    name: j.name,
-    source: j.source,
-    device: j.device,
-    colorMode: j.colorMode,
-    totalPages: j.totalPages,
-    size: j.size,
-    status: j.status,
-    createdAt: j.createdAt
-  }));
+  const isAdmin = req.user.isAdmin;
+
+  let summary = { totalJobs: 0, totalPages: 0, colorPages: 0, bwPages: 0 };
+  let recentJobs = [];
+  let allUsers = [];
 
   if (db) {
     try {
-      const sumDoc = await db.collection('stats').doc('summary').get();
-      if (sumDoc.exists) {
-        const d = sumDoc.data();
-        summary = {
-          totalJobs: d.totalJobs || 0,
-          totalPages: d.totalPages || 0,
-          colorPages: d.colorPages || 0,
-          bwPages: d.bwPages || 0
-        };
-      }
-      const snap = await db.collection('print_jobs').orderBy('timestamp', 'desc').limit(20).get();
-      if (!snap.empty) {
-        recentJobs = snap.docs.map(doc => {
+      if (isAdmin) {
+        const sumDoc = await db.collection('stats').doc('summary').get();
+        if (sumDoc.exists) {
+          const d = sumDoc.data();
+          summary = {
+            totalJobs: d.totalJobs || 0,
+            totalPages: d.totalPages || 0,
+            colorPages: d.colorPages || 0,
+            bwPages: d.bwPages || 0
+          };
+        }
+
+        const jobsSnap = await db.collection('print_jobs').orderBy('timestamp', 'desc').limit(30).get();
+        recentJobs = jobsSnap.docs.map(doc => {
           const d = doc.data();
           return {
             id: d.jobId || doc.id,
             name: d.name,
-            source: d.source,
+            userEmail: d.userEmail || '',
             device: d.device || d.source,
+            ip: d.ip || '',
             colorMode: d.colorMode || 'Color',
             totalPages: d.totalPages || 1,
-            size: d.size || 0,
             status: d.status,
             createdAt: d.createdAt
           };
         });
+
+        const usersSnap = await db.collection('users').get();
+        allUsers = usersSnap.docs.map(doc => {
+          const u = doc.data();
+          return {
+            email: u.email || '',
+            name: u.name || '',
+            role: u.role || 'user',
+            totalJobs: u.totalJobs || 0,
+            totalPages: u.totalPages || 0,
+            colorPages: u.colorPages || 0,
+            bwPages: u.bwPages || 0,
+            lastDevice: u.lastDevice || '—',
+            lastIp: u.lastIp || ''
+          };
+        }).sort((a, b) => b.totalPages - a.totalPages);
+      } else {
+        // Regular user: read ONLY their own summary & their own jobs (no composite index needed)
+        const userDoc = await db.collection('users').doc(req.user.uid).get();
+        if (userDoc.exists) {
+          const u = userDoc.data();
+          summary = {
+            totalJobs: u.totalJobs || 0,
+            totalPages: u.totalPages || 0,
+            colorPages: u.colorPages || 0,
+            bwPages: u.bwPages || 0
+          };
+        }
+
+        const myJobsSnap = await db.collection('print_jobs').where('uid', '==', req.user.uid).limit(50).get();
+        recentJobs = myJobsSnap.docs
+          .map(doc => {
+            const d = doc.data();
+            return {
+              id: d.jobId || doc.id,
+              name: d.name,
+              colorMode: d.colorMode || 'Color',
+              totalPages: d.totalPages || 1,
+              status: d.status,
+              createdAt: d.createdAt
+            };
+          })
+          .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
+          .slice(0, 20);
       }
     } catch (err) {
       console.error('[Firestore] Read error:', err.message);
+    }
+  } else {
+    const visible = isAdmin ? jobs : jobs.filter(j => j.uid === req.user.uid);
+    recentJobs = visible.slice(-20).reverse();
+    for (const j of visible) {
+      if (j.status === 'completed') {
+        summary.totalJobs += 1;
+        summary.totalPages += j.totalPages;
+        if (j.colorMode === 'Color') summary.colorPages += j.totalPages;
+        else summary.bwPages += j.totalPages;
+      }
     }
   }
 
   res.json({
     espOnline,
     espPrinterStatus: espOnline ? espPrinterStatus : 'Offline',
-    firestoreEnabled: Boolean(db),
+    user: req.user,
     summary,
-    jobs: recentJobs
+    jobs: recentJobs,
+    allUsers: isAdmin ? allUsers : []
   });
 });
 

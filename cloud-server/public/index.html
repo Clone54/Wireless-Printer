@@ -4,6 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Epson L3210 Cloud Print</title>
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
   <style>
     :root {
       --bg: #0b1120;
@@ -16,7 +18,6 @@
       --accent-hover: #2563eb;
       --ok: #22c55e;
       --warn: #f59e0b;
-      --err: #ef4444;
     }
     * { box-sizing: border-box; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; }
     body {
@@ -25,12 +26,19 @@
     }
     .hidden { display: none !important; }
     .login-wrap {
-      width: 100%; max-width: 400px; margin: auto; background: var(--card);
-      border: 1px solid var(--border); border-radius: 16px; padding: 28px; text-align: center;
+      width: 100%; max-width: 420px; margin: auto; background: var(--card);
+      border: 1px solid var(--border); border-radius: 16px; padding: 32px 26px; text-align: center;
     }
-    .login-wrap h1 { margin: 0 0 6px; font-size: 22px; }
-    .login-wrap p { color: var(--muted); font-size: 13px; margin: 0 0 20px; }
-    .container { width: 100%; max-width: 1040px; display: flex; flex-direction: column; gap: 16px; }
+    .login-wrap h1 { margin: 0 0 8px; font-size: 22px; }
+    .login-wrap p { color: var(--muted); font-size: 13px; margin: 0 0 22px; line-height: 1.5; }
+    .btn-google {
+      width: 100%; padding: 12px 16px; border-radius: 10px; border: 1px solid #cbd5e1;
+      background: #ffffff; color: #0f172a; font-size: 15px; font-weight: 600;
+      cursor: pointer; display: inline-flex; align-items: center; justify-content: center; gap: 10px;
+    }
+    .btn-google:hover { background: #f1f5f9; }
+    .btn-google:disabled { opacity: 0.6; cursor: not-allowed; }
+    .container { width: 100%; max-width: 1060px; display: flex; flex-direction: column; gap: 16px; }
     .header {
       background: var(--card); border: 1px solid var(--border); border-radius: 14px;
       padding: 16px 20px; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px;
@@ -41,6 +49,7 @@
     .badge { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 999px; font-size: 12px; font-weight: 600; }
     .ok { background: rgba(34,197,94,0.16); color: #4ade80; border: 1px solid rgba(34,197,94,0.3); }
     .off { background: rgba(245,158,11,0.16); color: #fbbf24; border: 1px solid rgba(245,158,11,0.3); }
+    .admin-tag { background: rgba(168,85,247,0.18); color: #d8b4fe; border: 1px solid rgba(168,85,247,0.35); }
     .btn-ghost {
       width: auto; padding: 6px 12px; background: transparent; border: 1px solid var(--border);
       color: var(--muted); font-size: 12px; border-radius: 8px; cursor: pointer;
@@ -56,7 +65,7 @@
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
     .section-title { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 12px; }
     label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 6px; text-align: left; }
-    input, select, button {
+    input, select, button.btn-primary {
       width: 100%; padding: 10px 12px; border-radius: 9px; border: 1px solid var(--border);
       background: var(--card-2); color: var(--text); font-size: 14px; outline: none;
     }
@@ -75,20 +84,14 @@
       min-height: 320px; display: flex; flex-direction: column; align-items: center; justify-content: center;
       overflow: hidden; position: relative; padding: 12px;
     }
-    .preview-box img {
-      max-width: 100%; max-height: 400px; object-fit: contain; border-radius: 6px;
-      transition: transform 0.25s ease;
-    }
+    .preview-box img { max-width: 100%; max-height: 400px; object-fit: contain; border-radius: 6px; transition: transform 0.25s ease; }
     .preview-box img.landscape-sim { transform: rotate(90deg) scale(0.78); }
     .preview-box iframe { width: 100%; height: 420px; border: none; border-radius: 6px; background: #fff; }
     .preview-empty { color: var(--muted); font-size: 13px; text-align: center; padding: 24px; }
-    .btn-primary {
-      background: var(--accent); border: none; font-weight: 600; cursor: pointer; margin-top: 16px; padding: 12px;
-      transition: background 0.15s;
-    }
-    .btn-primary:hover { background: var(--accent-hover); }
+    .btn-primary { background: var(--accent) !important; border: none !important; font-weight: 600; cursor: pointer; margin-top: 16px; padding: 12px; }
+    .btn-primary:hover { background: var(--accent-hover) !important; }
     .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
-    #msg, #loginErr { margin-top: 10px; font-size: 13px; line-height: 1.4; word-break: break-word; }
+    #msg, #loginErr { margin-top: 12px; font-size: 13px; line-height: 1.4; word-break: break-word; }
     .msg-ok { color: #4ade80; }
     .msg-err { color: #f87171; }
     .msg-info { color: #93c5fd; }
@@ -104,33 +107,35 @@
 </head>
 <body>
 
-  <!-- Login Screen -->
+  <!-- Google Sign-In Screen -->
   <div id="loginScreen" class="login-wrap">
     <h1>Epson L3210 Cloud Print</h1>
-    <p>Enter your print password to access the dashboard</p>
-    <label for="loginToken">Print Password</label>
-    <input id="loginToken" type="password" placeholder="Enter PRINT_TOKEN" onkeydown="if(event.key==='Enter') login()" />
-    <button class="btn-primary" id="loginBtn" onclick="login()">Unlock Dashboard</button>
+    <p id="loginHint">Sign in with your Google account to access the printer. You will stay signed in automatically on this device.</p>
+    <button class="btn-google" id="googleBtn" onclick="signInWithGoogle()" disabled>
+      <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+      Sign in with Google
+    </button>
     <div id="loginErr" class="msg-err"></div>
   </div>
 
-  <!-- Main Dashboard (hidden until authenticated) -->
+  <!-- Main Dashboard -->
   <div id="dashboard" class="container hidden">
     <div class="header">
       <div>
         <h1>Epson L3210 Cloud Print</h1>
-        <p class="sub" id="dbSub">Print PDFs &amp; photos from any network</p>
+        <p class="sub" id="userSub">Signed in</p>
       </div>
       <div class="header-right">
+        <span id="roleBadge" class="badge admin-tag hidden">Admin</span>
         <span id="espBadge" class="badge off">Checking...</span>
         <button class="btn-ghost" onclick="logout()">Sign Out</button>
       </div>
     </div>
 
-    <!-- Analytics Summary Cards -->
+    <!-- Summary Cards (Own stats for Users, All-users stats for Admin) -->
     <div class="stats-grid">
       <div class="stat-card">
-        <div class="stat-label">Total Pages</div>
+        <div class="stat-label" id="lblTotalPages">Your Total Pages</div>
         <div class="stat-val" id="statTotalPages">0</div>
       </div>
       <div class="stat-card">
@@ -142,7 +147,7 @@
         <div class="stat-val" style="color:#cbd5e1" id="statBwPages">0</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Total Jobs</div>
+        <div class="stat-label" id="lblTotalJobs">Your Print Jobs</div>
         <div class="stat-val" id="statTotalJobs">0</div>
       </div>
     </div>
@@ -223,78 +228,120 @@
       </div>
     </div>
 
-    <!-- Print History & Device Log -->
-    <div class="card" style="overflow-x:auto;">
-      <div class="section-title">Print History &amp; Device Analytics</div>
+    <!-- Admin-Only: All Users Breakdown -->
+    <div id="adminUsersCard" class="card hidden" style="overflow-x:auto;">
+      <div class="section-title">Admin View: All Users &amp; Devices</div>
       <table>
         <thead>
           <tr>
-            <th>Document</th>
-            <th>Device</th>
-            <th>Mode</th>
-            <th>Pages</th>
-            <th>Status</th>
-            <th>Time</th>
+            <th>User</th>
+            <th>Total Pages</th>
+            <th>Color</th>
+            <th>B&amp;W</th>
+            <th>Jobs</th>
+            <th>Last Device</th>
           </tr>
         </thead>
+        <tbody id="usersTable"></tbody>
+      </table>
+    </div>
+
+    <!-- Print History (Own jobs for Users, All jobs + Device/User for Admin) -->
+    <div class="card" style="overflow-x:auto;">
+      <div class="section-title" id="historyTitle">Your Print History</div>
+      <table>
+        <thead id="jobsHead"></thead>
         <tbody id="jobsTable">
-          <tr><td colspan="6" class="sub">Loading...</td></tr>
+          <tr><td class="sub">Loading...</td></tr>
         </tbody>
       </table>
     </div>
   </div>
 
   <script>
-    let authToken = localStorage.getItem('print_token') || '';
+    let currentUser = null;
+    let isAdmin = false;
     let currentBlobUrl = null;
     let statusTimer = null;
 
-    async function verifyAndEnter(token, showErr = false) {
+    async function initApp() {
       const errEl = document.getElementById('loginErr');
-      if (!token) return false;
+      const btn = document.getElementById('googleBtn');
       try {
-        const res = await fetch('/api/auth', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ token })
-        });
-        if (res.ok) {
-          const data = await res.json();
-          authToken = token;
-          localStorage.setItem('print_token', token);
-          document.getElementById('loginScreen').classList.add('hidden');
-          document.getElementById('dashboard').classList.remove('hidden');
-          document.getElementById('dbSub').textContent = data.firestoreEnabled
-            ? 'Print PDFs & photos from any network • Firestore Sync Active'
-            : 'Print PDFs & photos from any network • In-Memory Mode';
-          errEl.textContent = '';
-          refreshStatus();
-          if (!statusTimer) statusTimer = setInterval(refreshStatus, 4000);
-          return true;
-        } else if (showErr) {
-          errEl.textContent = 'Incorrect password. Please try again.';
+        const res = await fetch('/api/public-config');
+        const cfg = await res.json();
+        if (!cfg.firebaseConfig) {
+          errEl.textContent = 'Server missing FIREBASE_WEB_CONFIG_JSON environment variable.';
+          return;
         }
+        firebase.initializeApp(cfg.firebaseConfig);
+        btn.disabled = false;
+
+        // Automatically logs in if user previously signed in on this device
+        firebase.auth().onAuthStateChanged(async (user) => {
+          if (user) {
+            await onSignedIn(user);
+          } else {
+            onSignedOut();
+          }
+        });
       } catch (e) {
-        if (showErr) errEl.textContent = 'Cannot reach server.';
+        errEl.textContent = 'Failed to load authentication config.';
       }
-      return false;
     }
 
-    async function login() {
-      const btn = document.getElementById('loginBtn');
-      const val = document.getElementById('loginToken').value.trim();
-      btn.disabled = true;
-      await verifyAndEnter(val, true);
-      btn.disabled = false;
+    async function signInWithGoogle() {
+      const errEl = document.getElementById('loginErr');
+      errEl.textContent = '';
+      try {
+        const provider = new firebase.auth.GoogleAuthProvider();
+        await firebase.auth().signInWithPopup(provider);
+      } catch (e) {
+        errEl.textContent = e.message || 'Google Sign-In failed.';
+      }
     }
 
-    function logout() {
-      localStorage.removeItem('print_token');
-      authToken = '';
+    async function onSignedIn(user) {
+      currentUser = user;
+      const idToken = await user.getIdToken();
+      const meRes = await fetch('/api/me', {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${idToken}` }
+      });
+      if (!meRes.ok) {
+        document.getElementById('loginErr').textContent = 'Server rejected sign-in.';
+        return;
+      }
+      const meData = await meRes.json();
+      isAdmin = Boolean(meData.user && meData.user.isAdmin);
+
+      document.getElementById('loginScreen').classList.add('hidden');
+      document.getElementById('dashboard').classList.remove('hidden');
+      document.getElementById('userSub').textContent = `${user.email}`;
+      document.getElementById('roleBadge').classList.toggle('hidden', !isAdmin);
+      document.getElementById('adminUsersCard').classList.toggle('hidden', !isAdmin);
+      document.getElementById('lblTotalPages').textContent = isAdmin ? 'All Users Pages' : 'Your Total Pages';
+      document.getElementById('lblTotalJobs').textContent = isAdmin ? 'All Print Jobs' : 'Your Print Jobs';
+      document.getElementById('historyTitle').textContent = isAdmin ? 'All Print Jobs (Admin)' : 'Your Print History';
+
+      document.getElementById('jobsHead').innerHTML = isAdmin
+        ? '<tr><th>Document</th><th>User</th><th>Device</th><th>Mode</th><th>Pages</th><th>Status</th><th>Time</th></tr>'
+        : '<tr><th>Document</th><th>Mode</th><th>Pages</th><th>Status</th><th>Time</th></tr>';
+
+      refreshStatus();
+      if (!statusTimer) statusTimer = setInterval(refreshStatus, 4000);
+    }
+
+    function onSignedOut() {
+      currentUser = null;
+      isAdmin = false;
       if (statusTimer) { clearInterval(statusTimer); statusTimer = null; }
-      document.getElementById('loginToken').value = '';
       document.getElementById('dashboard').classList.add('hidden');
       document.getElementById('loginScreen').classList.remove('hidden');
+    }
+
+    async function logout() {
+      await firebase.auth().signOut();
     }
 
     function toggleCustomPages() {
@@ -313,11 +360,7 @@
       const meta = document.getElementById('fileMeta');
       const box = document.getElementById('previewBox');
 
-      if (currentBlobUrl) {
-        URL.revokeObjectURL(currentBlobUrl);
-        currentBlobUrl = null;
-      }
-
+      if (currentBlobUrl) { URL.revokeObjectURL(currentBlobUrl); currentBlobUrl = null; }
       if (!file) {
         meta.textContent = 'Supports PDF, PNG, JPG (max 25 MB)';
         box.innerHTML = '<div class="preview-empty">Select a PDF or photo above to preview it here before printing.</div>';
@@ -342,10 +385,11 @@
     }
 
     async function refreshStatus() {
-      if (!authToken) return;
+      if (!currentUser) return;
       try {
-        const res = await fetch('/api/status', { headers: { 'x-print-token': authToken } });
-        if (res.status === 401) { logout(); return; }
+        const idToken = await currentUser.getIdToken();
+        const res = await fetch('/api/status', { headers: { 'Authorization': `Bearer ${idToken}` } });
+        if (res.status === 401) return;
         const data = await res.json();
 
         const badge = document.getElementById('espBadge');
@@ -359,16 +403,40 @@
           document.getElementById('statTotalJobs').textContent = data.summary.totalJobs || 0;
         }
 
+        if (isAdmin && data.allUsers) {
+          const ut = document.getElementById('usersTable');
+          ut.innerHTML = data.allUsers.length
+            ? data.allUsers.map(u => `<tr>
+                <td><b>${u.name || u.email}</b><br><small style="color:#94a3b8">${u.email}</small></td>
+                <td><b>${u.totalPages}</b></td>
+                <td style="color:#60a5fa">${u.colorPages}</td>
+                <td>${u.bwPages}</td>
+                <td>${u.totalJobs}</td>
+                <td>${u.lastDevice || '—'}</td>
+              </tr>`).join('')
+            : '<tr><td colspan="6" class="sub">No users yet.</td></tr>';
+        }
+
         const tbody = document.getElementById('jobsTable');
         if (!data.jobs || !data.jobs.length) {
-          tbody.innerHTML = '<tr><td colspan="6" class="sub">No print jobs yet.</td></tr>';
+          tbody.innerHTML = `<tr><td colspan="${isAdmin ? 7 : 5}" class="sub">No print jobs yet.</td></tr>`;
         } else {
           tbody.innerHTML = data.jobs.map(j => {
             const isColor = j.colorMode !== 'B&W';
             const timeStr = j.createdAt ? new Date(j.createdAt).toLocaleString() : '—';
+            if (isAdmin) {
+              return `<tr>
+                <td>${j.name}</td>
+                <td>${j.userEmail || '—'}</td>
+                <td>${j.device || '—'}</td>
+                <td><span class="pill ${isColor ? 'pill-color' : 'pill-bw'}">${j.colorMode || 'Color'}</span></td>
+                <td>${j.totalPages || 1}</td>
+                <td><span class="pill pill-status">${j.status}</span></td>
+                <td style="color:#94a3b8;font-size:12px;">${timeStr}</td>
+              </tr>`;
+            }
             return `<tr>
               <td>${j.name}</td>
-              <td>${j.device || j.source}</td>
               <td><span class="pill ${isColor ? 'pill-color' : 'pill-bw'}">${j.colorMode || 'Color'}</span></td>
               <td>${j.totalPages || 1}</td>
               <td><span class="pill pill-status">${j.status}</span></td>
@@ -380,6 +448,7 @@
     }
 
     async function sendJob() {
+      if (!currentUser) return;
       const file = document.getElementById('file').files[0];
       const msg = document.getElementById('msg');
       if (!file) { msg.className = 'msg-err'; msg.textContent = 'Please choose a PDF or image file.'; return; }
@@ -408,9 +477,10 @@
       form.append('copies', document.getElementById('copies').value);
 
       try {
+        const idToken = await currentUser.getIdToken();
         const res = await fetch('/api/print-file', {
           method: 'POST',
-          headers: { 'x-print-token': authToken },
+          headers: { 'Authorization': `Bearer ${idToken}` },
           body: form
         });
         const data = await res.json();
@@ -430,10 +500,7 @@
       }
     }
 
-    // Auto-login if token was previously saved
-    if (authToken) {
-      verifyAndEnter(authToken, false);
-    }
+    initApp();
   </script>
 </body>
 </html>
