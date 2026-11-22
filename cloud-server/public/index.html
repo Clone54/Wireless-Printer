@@ -137,6 +137,10 @@
       background: var(--card-2); cursor: pointer; transition: border-color 0.2s;
     }
     .dropzone:hover { border-color: var(--accent); }
+    .dropzone.dragover {
+      border-color: var(--accent);
+      background: rgba(59, 130, 246, 0.14);
+    }
     .dropzone input[type="file"] { display: none; }
     .file-meta { font-size: 12px; color: var(--muted); margin-top: 6px; }
     .preview-box {
@@ -171,7 +175,7 @@
 
   <!-- Google Sign-In Screen with 4-Step Animated System Process -->
   <div id="loginScreen" class="login-wrap">
-    <h1>Epson L3210 Cloud Print</h1>
+    <h1>Firoz Printing Cloud Print (Hamid-113)</h1>
     <p id="loginHint">Print PDFs &amp; photos wirelessly from any network in 4 simple steps.</p>
     <div class="rate-banner">
       <span>Color: <b>4 BDT / page</b></span>
@@ -227,7 +231,7 @@
   <div id="dashboard" class="container hidden">
     <div class="header">
       <div>
-        <h1>Epson L3210 Cloud Print</h1>
+        <h1>Firoz Printing Cloud Print (Hamid-113)</h1>
         <p class="sub" id="userSub">Signed in</p>
       </div>
       <div class="header-right">
@@ -266,7 +270,7 @@
       <!-- Left: Document & Live Preview -->
       <div class="card">
         <div class="section-title">1. Document &amp; Preview</div>
-        <div class="dropzone" onclick="document.getElementById('file').click()">
+        <div class="dropzone" id="dropzone" onclick="document.getElementById('file').click()">
           <div style="font-weight: 600; font-size: 14px;">Tap to choose a PDF or Photo</div>
           <div class="file-meta" id="fileMeta">Supports PDF, PNG, JPG (max 25 MB)</div>
           <input id="file" type="file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/*" onchange="handleFileSelect()" />
@@ -729,7 +733,28 @@
         btn.disabled = false;
       }
     }
-
+    const dz = document.getElementById('dropzone');
+    ['dragenter', 'dragover'].forEach(ev => {
+      dz.addEventListener(ev, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dz.classList.add('dragover');
+      });
+    });
+    ['dragleave', 'drop'].forEach(ev => {
+      dz.addEventListener(ev, (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        dz.classList.remove('dragover');
+      });
+    });
+    dz.addEventListener('drop', (e) => {
+      const files = e.dataTransfer && e.dataTransfer.files;
+      if (files && files.length > 0) {
+        document.getElementById('file').files = files;
+        handleFileSelect();
+      }
+    });
     initApp();
   </script>
 </body>
