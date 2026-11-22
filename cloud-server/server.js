@@ -125,6 +125,7 @@ app.post('/api/print-file', upload.single('file'), requireToken, async (req, res
     const a1 = await runFilter('cupsfilter', [
       '-e',
       '-p', PPD_PATH,
+      '-d', 'epson_l3210',
       '-m', 'printer/foo',
       '-o', `PageSize=${paper}`,
       '-o', `media=${paper}`,
@@ -133,7 +134,7 @@ app.post('/api/print-file', upload.single('file'), requireToken, async (req, res
       '-o', `copies=${copies}`,
       '-o', 'fit-to-page',
       inputPath
-    ], null, { PPD: PPD_PATH });
+    ], null, { PPD: PPD_PATH, PRINTER: 'epson_l3210', CUPS_SERVERROOT: '/etc/cups' });
 
     let finalBuf = a1.stdout;
     let diagLog = `A1(cupsfilter -e): ${describeHeader(a1.stdout)} err=[${a1.stderr.trim()}]`;
@@ -149,7 +150,7 @@ app.post('/api/print-file', upload.single('file'), requireToken, async (req, res
         '-o', 'MediaType=PLAIN_NORMAL',
         '-o', 'fit-to-page',
         inputPath
-      ], null, { PPD: PPD_PATH });
+      ], null, { PPD: PPD_PATH, PRINTER: 'epson_l3210', CUPS_SERVERROOT: '/etc/cups' });
 
       diagLog += ` | A2-Raster: ${describeHeader(a2Ras.stdout)}`;
 
@@ -172,7 +173,7 @@ app.post('/api/print-file', upload.single('file'), requireToken, async (req, res
           '-dcupsColorOrder=0',
           '-sOutputFile=-',
           pdfPath
-        ], null, { PPD: PPD_PATH });
+        ], null, { PPD: PPD_PATH, PRINTER: 'epson_l3210', CUPS_SERVERROOT: '/etc/cups' });
         if (pdfPath !== inputPath) fs.unlink(pdfPath, () => {});
         rasterBuf = gsRas.stdout;
         diagLog += ` | A3-GS-Raster: ${describeHeader(rasterBuf)} err=[${gsRas.stderr.trim()}]`;
@@ -184,7 +185,7 @@ app.post('/api/print-file', upload.single('file'), requireToken, async (req, res
           '/usr/lib/cups/filter/epson-escpr-wrapper',
           ['1', 'root', req.file.originalname || 'Job', String(copies), optsStr],
           rasterBuf,
-          { PPD: PPD_PATH }
+          { PPD: PPD_PATH, PRINTER: 'epson_l3210', CUPS_SERVERROOT: '/etc/cups' }
         );
         finalBuf = wrapRes.stdout;
         diagLog += ` | Wrapper: ${describeHeader(finalBuf)} err=[${wrapRes.stderr.trim()}]`;
