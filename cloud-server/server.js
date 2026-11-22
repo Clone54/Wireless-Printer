@@ -34,7 +34,7 @@ function requireToken(req, res, next) {
 
 function describeHeader(buf) {
   if (!buf || buf.length === 0) return 'EMPTY (0 bytes)';
-  const ascii = buf.slice(0, 24).toString('latin1').replace(/[^ -~]/g, '.');
+  const ascii = buf.slice(0, 24).toString('latin1').replace(/[^\x20-\x7E]/g, '.');
   const hex = buf.slice(0, 12).toString('hex');
   return `${buf.length} bytes [ascii="${ascii}" hex=${hex}]`;
 }
@@ -118,45 +118,60 @@ app.post('/api/print-file', upload.single('file'), requireToken, async (req, res
   const paper = req.body.paper === 'Letter' ? 'Letter' : 'A4';
   const ink = (req.body.color === 'Gray' || req.body.color === 'MONO') ? 'MONO' : 'COLOR';
   const copies = Math.max(1, Math.min(20, parseInt(req.body.copies || '1', 10) || 1));
-  const optsStr = `PageSize=${paper} media=${paper} Ink=${ink} MediaType=PLAIN_NORMAL fit-to-page`;
+  const orientation = req.body.orientation === 'landscape' ? 'landscape' : 'portrait';
+  const pageMode = req.body.pageMode || 'all';
+  const customPages = String(req.body.customPages || '').replace(/[^0-9,\-]/g, '');
+  const quality = ['PLAIN_NORMAL', 'PLAIN_HIGH', 'PMPHOTO_NORMAL'].includes(req.body.quality)
+    ? req.body.quality
+    : 'PLAIN_NORMAL';
+
+  const cupsOpts = [
+    '-o', `PageSize=${paper}`,
+    '-o', `media=${paper}`,
+    '-o', `Ink=${ink}`,
+    '-o', `MediaType=${quality}`,
+    '-o', 'fit-to-page'
+  ];
+
+  if (orientation === 'landscape') {
+    cupsOpts.push('-o', 'landscape');
+  }
+  if (pageMode === 'odd') {
+    cupsOpts.push('-o', 'page-set=odd');
+  } else if (pageMode === 'even') {
+    cupsOpts.push('-o', 'page-set=even');
+  } else if (pageMode === 'custom' && customPages) {
+    cupsOpts.push('-o', `page-ranges=${customPages}`);
+  }
+
+  const optsStr = `PageSize=${paper} media=${paper} Ink=${ink} MediaType=${quality} fit-to-page`;
+  const envVars = { PPD: PPD_PATH, PRINTER: 'epson_l3210', CUPS_SERVERROOT: '/etc/cups' };
 
   try {
-    // Attempt 1: cupsfilter -e -p PPD -m printer/foo
     const a1 = await runFilter('cupsfilter', [
       '-e',
       '-p', PPD_PATH,
       '-d', 'epson_l3210',
       '-m', 'printer/foo',
-      '-o', `PageSize=${paper}`,
-      '-o', `media=${paper}`,
-      '-o', `Ink=${ink}`,
-      '-o', 'MediaType=PLAIN_NORMAL',
+      ...cupsOpts,
       '-o', `copies=${copies}`,
-      '-o', 'fit-to-page',
       inputPath
-    ], null, { PPD: PPD_PATH, PRINTER: 'epson_l3210', CUPS_SERVERROOT: '/etc/cups' });
+    ], null, envVars);
 
     let finalBuf = a1.stdout;
     let diagLog = `A1(cupsfilter -e): ${describeHeader(a1.stdout)} err=[${a1.stderr.trim()}]`;
 
-    // Attempt 2: 2-stage pipeline (cupsfilter -> application/vnd.cups-raster -> pipe to epson-escpr-wrapper via stdin)
     if (!isValidEscpr(finalBuf)) {
       const a2Ras = await runFilter('cupsfilter', [
         '-p', PPD_PATH,
         '-m', 'application/vnd.cups-raster',
-        '-o', `PageSize=${paper}`,
-        '-o', `media=${paper}`,
-        '-o', `Ink=${ink}`,
-        '-o', 'MediaType=PLAIN_NORMAL',
-        '-o', 'fit-to-page',
+        ...cupsOpts,
         inputPath
-      ], null, { PPD: PPD_PATH, PRINTER: 'epson_l3210', CUPS_SERVERROOT: '/etc/cups' });
+      ], null, envVars);
 
       diagLog += ` | A2-Raster: ${describeHeader(a2Ras.stdout)}`;
-
       let rasterBuf = a2Ras.stdout;
 
-      // Attempt 3: Ghostscript direct PDF/Image -> CUPS Raster at 360x360 DPI
       if (!rasterBuf || rasterBuf.length < 64) {
         let pdfPath = inputPath;
         if (ext !== '.pdf') {
@@ -173,19 +188,18 @@ app.post('/api/print-file', upload.single('file'), requireToken, async (req, res
           '-dcupsColorOrder=0',
           '-sOutputFile=-',
           pdfPath
-        ], null, { PPD: PPD_PATH, PRINTER: 'epson_l3210', CUPS_SERVERROOT: '/etc/cups' });
+        ], null, envVars);
         if (pdfPath !== inputPath) fs.unlink(pdfPath, () => {});
         rasterBuf = gsRas.stdout;
         diagLog += ` | A3-GS-Raster: ${describeHeader(rasterBuf)} err=[${gsRas.stderr.trim()}]`;
       }
 
       if (rasterBuf && rasterBuf.length >= 64) {
-        // Pipe CUPS Raster via STDIN (fd 0) to epson-escpr-wrapper (5 args = read from stdin)
         const wrapRes = await runFilter(
           '/usr/lib/cups/filter/epson-escpr-wrapper',
           ['1', 'root', req.file.originalname || 'Job', String(copies), optsStr],
           rasterBuf,
-          { PPD: PPD_PATH, PRINTER: 'epson_l3210', CUPS_SERVERROOT: '/etc/cups' }
+          envVars
         );
         finalBuf = wrapRes.stdout;
         diagLog += ` | Wrapper: ${describeHeader(finalBuf)} err=[${wrapRes.stderr.trim()}]`;
@@ -220,7 +234,6 @@ app.post('/api/print-file', upload.single('file'), requireToken, async (req, res
   }
 });
 
-// Laptop Relay: receive pre-rendered raw ESC/P-R bytes from Windows/Mac driver
 app.post('/api/print-raw', requireToken, express.raw({ type: '*/*', limit: '50mb' }), (req, res) => {
   if (!req.body || req.body.length === 0) {
     return res.status(400).json({ error: 'Empty print payload' });
@@ -247,7 +260,6 @@ app.post('/api/print-raw', requireToken, express.raw({ type: '*/*', limit: '50mb
   res.json({ ok: true, jobId, size: job.size });
 });
 
-// ESP32-S3: poll for next queued job
 app.get('/api/esp/poll', requireToken, (req, res) => {
   lastEspSeen = Date.now();
   if (req.query.status) {
@@ -263,7 +275,6 @@ app.get('/api/esp/poll', requireToken, (req, res) => {
   res.json({ id: nextJob.id, size: nextJob.size, name: nextJob.name });
 });
 
-// ESP32-S3: stream raw .prn bytes
 app.get('/api/esp/job/:id', requireToken, (req, res) => {
   const job = jobs.find(j => j.id === req.params.id);
   if (!job || !fs.existsSync(job.filePath)) {
@@ -274,7 +285,6 @@ app.get('/api/esp/job/:id', requireToken, (req, res) => {
   fs.createReadStream(job.filePath).pipe(res);
 });
 
-// ESP32-S3: mark job complete or failed
 app.post('/api/esp/job/:id/done', requireToken, express.json(), (req, res) => {
   const job = jobs.find(j => j.id === req.params.id);
   if (!job) return res.status(404).json({ error: 'Job not found' });
@@ -288,7 +298,6 @@ app.post('/api/esp/job/:id/done', requireToken, express.json(), (req, res) => {
   res.json({ ok: true });
 });
 
-// Web UI: status & recent jobs
 app.get('/api/status', requireToken, (req, res) => {
   const espOnline = (Date.now() - lastEspSeen) < 15000;
   res.json({

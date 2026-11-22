@@ -30,4 +30,11 @@ else
   echo "[CUPS] WARNING: No escpr PPD found!"
 fi
 
+# Startup check: verify /usr/lib/cups/filter/epson-escpr-wrapper exists
+if [ -x /usr/lib/cups/filter/epson-escpr-wrapper ]; then
+  echo "[CUPS] ✓ epson-escpr-wrapper filter verified"
+else
+  echo "[CUPS] ✗ WARNING: /usr/lib/cups/filter/epson-escpr-wrapper missing!"
+fi
+
 exec node /app/server.js

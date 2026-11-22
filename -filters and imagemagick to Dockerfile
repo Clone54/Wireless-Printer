@@ -1,0 +1,15 @@
+[33mcommit 2440f13d1e686bdc9ecaba0263eda89d27b51360[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m)[m
+Author: Firoz Ahmed <firozahmedshoykot44@gmail.com>
+Date:   Sun Nov 22 14:05:52 2026 +0600
+
+    ujhenfd
+
+ README(1).md                              |  24 [32m+++++[m
+ cloud-server/public/index(1).html         | 147 [32m+++++++++++++++++++++++++++++[m
+ cloud-server/server.js                    |  98 [32m+++++++++++++++++[m[31m---[m
+ esp32-firmware/ESP32S3_INTEGRATION(1).txt |  25 [32m+++++[m
+ esp32-firmware/cloud_client(1).cpp        | 149 [32m++++++++++++++++++++++++++++++[m
+ esp32-firmware/cloud_client(1).h          |  25 [32m+++++[m
+ laptop-relay/laptop_relay(1).py           |  67 [32m++++++++++++++[m
+ laptop-relay/start_relay(1).bat           |   5 [32m+[m
+ 8 files changed, 525 insertions(+), 15 deletions(-)
