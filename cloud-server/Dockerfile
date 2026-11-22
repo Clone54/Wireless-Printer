@@ -2,14 +2,17 @@ FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y \
     nodejs \
     npm \
     cups \
     cups-bsd \
+    cups-client \
+    cups-filters \
     printer-driver-escpr \
     ghostscript \
     poppler-utils \
+    imagemagick \
     ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 
