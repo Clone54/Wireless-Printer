@@ -3,7 +3,7 @@ const multer = require('multer');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { execFile } = require('child_process');
+const { spawn } = require('child_process');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -32,70 +32,180 @@ function requireToken(req, res, next) {
   next();
 }
 
-// Verify that buffer contains genuine Epson ESC/P-R commands (never PDF, PostScript, or CUPS Raster)
+function describeHeader(buf) {
+  if (!buf || buf.length === 0) return 'EMPTY (0 bytes)';
+  const ascii = buf.slice(0, 24).toString('latin1').replace(/[^ -~]/g, '.');
+  const hex = buf.slice(0, 12).toString('hex');
+  return `${buf.length} bytes [ascii="${ascii}" hex=${hex}]`;
+}
+
 function isValidEscpr(buf) {
   if (!buf || buf.length < 32) return false;
   const head = buf.slice(0, 8).toString('latin1');
-  if (head.startsWith('%PDF-') || head.startsWith('%!PS') || head.startsWith('3SaR') || head.startsWith('RaS3') || head.startsWith('2SaR') || head.startsWith('RaS2')) {
+  if (
+    head.startsWith('%PDF-') ||
+    head.startsWith('%!PS') ||
+    head.startsWith('3SaR') ||
+    head.startsWith('RaS3') ||
+    head.startsWith('2SaR') ||
+    head.startsWith('RaS2') ||
+    head.startsWith('<!DOC') ||
+    head.startsWith('<html')
+  ) {
     return false;
   }
-  const sample = buf.slice(0, Math.min(buf.length, 4096)).toString('latin1');
-  return sample.includes('ESCPR') || sample.includes('@EJL') || sample.includes('REMOTE1');
+  const sample = buf.slice(0, Math.min(buf.length, 8192)).toString('latin1');
+  return (
+    sample.includes('ESCPR') ||
+    sample.includes('@EJL') ||
+    sample.includes('REMOTE1') ||
+    sample.includes('EPSON') ||
+    (buf[0] === 0x1b && buf[1] === 0x40)
+  );
+}
+
+function runFilter(cmd, args, stdinBuf, envExtra = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, args, {
+      env: { ...process.env, ...envExtra },
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    const outChunks = [];
+    const errChunks = [];
+    child.stdout.on('data', (d) => outChunks.push(d));
+    child.stderr.on('data', (d) => errChunks.push(d));
+    child.on('error', (err) => {
+      resolve({ code: -1, stdout: Buffer.alloc(0), stderr: err.message });
+    });
+    child.on('close', (code) => {
+      resolve({
+        code,
+        stdout: Buffer.concat(outChunks),
+        stderr: Buffer.concat(errChunks).toString('utf8').slice(-600)
+      });
+    });
+    if (stdinBuf && stdinBuf.length > 0) {
+      child.stdin.on('error', () => {});
+      child.stdin.end(stdinBuf);
+    } else {
+      child.stdin.end();
+    }
+  });
 }
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Phone / Web UI: upload PDF or image -> CUPS Raster -> epson-escpr-wrapper -> ESC/P-R
-app.post('/api/print-file', upload.single('file'), requireToken, (req, res) => {
+app.post('/api/print-file', upload.single('file'), requireToken, async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded' });
   }
+
+  const ext = path.extname(req.file.originalname || '').toLowerCase() || '.pdf';
+  const inputPath = `${req.file.path}${ext}`;
+  fs.renameSync(req.file.path, inputPath);
+
+  const cleanup = () => {
+    fs.unlink(inputPath, () => {});
+  };
+
   if (!fs.existsSync(PPD_PATH)) {
-    fs.unlink(req.file.path, () => {});
-    return res.status(500).json({ error: 'Epson PPD not initialized in CUPS' });
+    cleanup();
+    return res.status(500).json({ error: 'Epson PPD (/etc/cups/ppd/epson_l3210.ppd) not found in container' });
   }
 
   const jobId = crypto.randomBytes(6).toString('hex');
-  const rasterPath = path.join(JOBS_DIR, `${jobId}.ras`);
   const outPath = path.join(JOBS_DIR, `${jobId}.prn`);
   const paper = req.body.paper === 'Letter' ? 'Letter' : 'A4';
-  // Epson ESC/P-R PPD uses Ink=COLOR or Ink=MONO
   const ink = (req.body.color === 'Gray' || req.body.color === 'MONO') ? 'MONO' : 'COLOR';
   const copies = Math.max(1, Math.min(20, parseInt(req.body.copies || '1', 10) || 1));
   const optsStr = `PageSize=${paper} media=${paper} Ink=${ink} MediaType=PLAIN_NORMAL fit-to-page`;
 
-  // Stage 1: try direct cupsfilter -e -> printer/epson_l3210
-  const directArgs = [
-    '-e',
-    '-p', PPD_PATH,
-    '-m', 'printer/epson_l3210',
-    '-o', `PageSize=${paper}`,
-    '-o', `media=${paper}`,
-    '-o', `Ink=${ink}`,
-    '-o', 'MediaType=PLAIN_NORMAL',
-    '-o', `copies=${copies}`,
-    '-o', 'fit-to-page',
-    req.file.path
-  ];
+  try {
+    // Attempt 1: cupsfilter -e -p PPD -m printer/foo
+    const a1 = await runFilter('cupsfilter', [
+      '-e',
+      '-p', PPD_PATH,
+      '-m', 'printer/foo',
+      '-o', `PageSize=${paper}`,
+      '-o', `media=${paper}`,
+      '-o', `Ink=${ink}`,
+      '-o', 'MediaType=PLAIN_NORMAL',
+      '-o', `copies=${copies}`,
+      '-o', 'fit-to-page',
+      inputPath
+    ], null, { PPD: PPD_PATH });
 
-  function finalizeJob(prnBuf) {
-    fs.unlink(req.file.path, () => {});
-    fs.unlink(rasterPath, () => {});
+    let finalBuf = a1.stdout;
+    let diagLog = `A1(cupsfilter -e): ${describeHeader(a1.stdout)} err=[${a1.stderr.trim()}]`;
 
-    if (!isValidEscpr(prnBuf)) {
-      const preview = prnBuf ? prnBuf.slice(0, 32).toString('latin1') : 'empty';
-      console.error('[CUPS] Rejected non-ESC/P-R output. Header:', JSON.stringify(preview));
+    // Attempt 2: 2-stage pipeline (cupsfilter -> application/vnd.cups-raster -> pipe to epson-escpr-wrapper via stdin)
+    if (!isValidEscpr(finalBuf)) {
+      const a2Ras = await runFilter('cupsfilter', [
+        '-p', PPD_PATH,
+        '-m', 'application/vnd.cups-raster',
+        '-o', `PageSize=${paper}`,
+        '-o', `media=${paper}`,
+        '-o', `Ink=${ink}`,
+        '-o', 'MediaType=PLAIN_NORMAL',
+        '-o', 'fit-to-page',
+        inputPath
+      ], null, { PPD: PPD_PATH });
+
+      diagLog += ` | A2-Raster: ${describeHeader(a2Ras.stdout)}`;
+
+      let rasterBuf = a2Ras.stdout;
+
+      // Attempt 3: Ghostscript direct PDF/Image -> CUPS Raster at 360x360 DPI
+      if (!rasterBuf || rasterBuf.length < 64) {
+        let pdfPath = inputPath;
+        if (ext !== '.pdf') {
+          pdfPath = `${inputPath}.pdf`;
+          await runFilter('convert', [inputPath, '-page', paper, pdfPath], null);
+        }
+        const gsRas = await runFilter('gs', [
+          '-q', '-dNOPAUSE', '-dBATCH', '-dSAFER',
+          '-sDEVICE=cups',
+          '-r360x360',
+          `-sPAPERSIZE=${paper.toLowerCase()}`,
+          '-dcupsColorSpace=1',
+          '-dcupsBitsPerColor=8',
+          '-dcupsColorOrder=0',
+          '-sOutputFile=-',
+          pdfPath
+        ], null, { PPD: PPD_PATH });
+        if (pdfPath !== inputPath) fs.unlink(pdfPath, () => {});
+        rasterBuf = gsRas.stdout;
+        diagLog += ` | A3-GS-Raster: ${describeHeader(rasterBuf)} err=[${gsRas.stderr.trim()}]`;
+      }
+
+      if (rasterBuf && rasterBuf.length >= 64) {
+        // Pipe CUPS Raster via STDIN (fd 0) to epson-escpr-wrapper (5 args = read from stdin)
+        const wrapRes = await runFilter(
+          '/usr/lib/cups/filter/epson-escpr-wrapper',
+          ['1', 'root', req.file.originalname || 'Job', String(copies), optsStr],
+          rasterBuf,
+          { PPD: PPD_PATH }
+        );
+        finalBuf = wrapRes.stdout;
+        diagLog += ` | Wrapper: ${describeHeader(finalBuf)} err=[${wrapRes.stderr.trim()}]`;
+      }
+    }
+
+    cleanup();
+    console.log('[CUPS Pipeline]', diagLog);
+
+    if (!isValidEscpr(finalBuf)) {
       return res.status(500).json({
-        error: 'Safety block: output was not valid Epson ESC/P-R data (printer will not waste paper).'
+        error: `Safety block (no paper wasted). Diagnostics: ${diagLog}`
       });
     }
 
-    fs.writeFileSync(outPath, prnBuf);
+    fs.writeFileSync(outPath, finalBuf);
     const job = {
       id: jobId,
       name: req.file.originalname || 'Document',
       source: 'Web/Phone',
-      size: prnBuf.length,
+      size: finalBuf.length,
       status: 'queued',
       createdAt: new Date().toISOString(),
       filePath: outPath
@@ -103,50 +213,10 @@ app.post('/api/print-file', upload.single('file'), requireToken, (req, res) => {
     jobs.push(job);
     console.log(`[Queue] Verified ESC/P-R job ${jobId} (${job.name}, ${job.size} bytes)`);
     return res.json({ ok: true, job: { id: job.id, name: job.name, size: job.size, status: job.status } });
+  } catch (e) {
+    cleanup();
+    return res.status(500).json({ error: `Conversion exception: ${e.message}` });
   }
-
-  execFile('cupsfilter', directArgs, { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 }, (err, stdout, stderr) => {
-    if (!err && isValidEscpr(stdout)) {
-      return finalizeJob(stdout);
-    }
-
-    // Stage 2 Fallback: render to CUPS Raster first, then invoke /usr/lib/cups/filter/epson-escpr-wrapper directly
-    console.log('[CUPS] Direct cupsfilter did not produce ESC/P-R, running 2-step raster -> epson-escpr-wrapper...');
-    const rasterArgs = [
-      '-p', PPD_PATH,
-      '-m', 'application/vnd.cups-raster',
-      '-o', `PageSize=${paper}`,
-      '-o', `media=${paper}`,
-      '-o', `Ink=${ink}`,
-      '-o', 'MediaType=PLAIN_NORMAL',
-      '-o', 'fit-to-page',
-      req.file.path
-    ];
-
-    execFile('cupsfilter', rasterArgs, { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024 }, (rErr, rOut, rStderr) => {
-      if (rErr || !rOut || rOut.length === 0) {
-        fs.unlink(req.file.path, () => {});
-        console.error('[CUPS] Raster conversion failed:', rErr?.message, rStderr?.toString());
-        return res.status(500).json({ error: 'Failed to rasterize file in CUPS' });
-      }
-
-      fs.writeFileSync(rasterPath, rOut);
-      const wrapperBin = '/usr/lib/cups/filter/epson-escpr-wrapper';
-      const wrapperArgs = ['1', 'root', req.file.originalname || 'Job', String(copies), optsStr, rasterPath];
-
-      execFile(
-        wrapperBin,
-        wrapperArgs,
-        { encoding: 'buffer', maxBuffer: 64 * 1024 * 1024, env: { ...process.env, PPD: PPD_PATH } },
-        (wErr, wOut, wStderr) => {
-          if (wErr) {
-            console.error('[CUPS] epson-escpr-wrapper error:', wErr?.message, wStderr?.toString());
-          }
-          return finalizeJob(wOut);
-        }
-      );
-    });
-  });
 });
 
 // Laptop Relay: receive pre-rendered raw ESC/P-R bytes from Windows/Mac driver
@@ -155,7 +225,7 @@ app.post('/api/print-raw', requireToken, express.raw({ type: '*/*', limit: '50mb
     return res.status(400).json({ error: 'Empty print payload' });
   }
   if (!isValidEscpr(req.body)) {
-    return res.status(400).json({ error: 'Rejected: payload is not valid Epson ESC/P-R data' });
+    return res.status(400).json({ error: `Rejected non-ESC/P-R payload: ${describeHeader(req.body)}` });
   }
 
   const jobId = crypto.randomBytes(6).toString('hex');
