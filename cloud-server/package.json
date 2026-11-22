@@ -1,13 +1,14 @@
 {
   "name": "epson-l3210-cloud-relay",
-  "version": "1.0.0",
-  "description": "Cloud Print Relay with CUPS ESC/P-R conversion for ESP32-S3 + Epson L3210",
+  "version": "1.1.0",
+  "description": "Cloud Print Relay with CUPS ESC/P-R, Login Gate, Analytics & Firestore",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
     "express": "^4.19.2",
+    "firebase-admin": "^12.7.0",
     "multer": "^1.4.5-lts.1"
   }
 }
