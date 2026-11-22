@@ -315,6 +315,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.get('/api/public-config', (req, res) => {
   res.json({
     firebaseConfig: webConfig,
+    googleClientId: process.env.GOOGLE_CLIENT_ID || '',
     firestoreEnabled: Boolean(db),
     rates: { colorBdt: RATE_COLOR_BDT, bwBdt: RATE_BW_BDT }
   });
@@ -357,22 +358,12 @@ app.post('/api/admin/reset-due', requireGoogleUser, express.json(), async (req, 
   res.json({ ok: true });
 });
 
-function decodeFilename(name) {
-  if (!name) return 'Document';
-  try {
-    return Buffer.from(name, 'latin1').toString('utf8');
-  } catch {
-    return name;
-  }
-}
-
 app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded' });
   }
-  
-  const originalName = decodeFilename(req.file.originalname);
-  const ext = path.extname(originalName).toLowerCase() || '.pdf';
+
+  const ext = path.extname(req.file.originalname || '').toLowerCase() || '.pdf';
   const inputPath = `${req.file.path}${ext}`;
   fs.renameSync(req.file.path, inputPath);
 
@@ -461,7 +452,7 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
       if (rasterBuf && rasterBuf.length >= 64) {
         const wrapRes = await runFilter(
           '/usr/lib/cups/filter/epson-escpr-wrapper',
-          ['1', 'root', originalName, String(copies), optsStr],
+          ['1', 'root', req.file.originalname || 'Job', String(copies), optsStr],
           rasterBuf, envVars
         );
         finalBuf = wrapRes.stdout;
@@ -482,7 +473,7 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
       uid: req.user.uid,
       userEmail: req.user.email,
       userName: req.user.name,
-      name: originalName,
+      name: req.file.originalname || 'Document',
       source: 'Web/Phone',
       device: devInfo.device,
       ip: devInfo.ip,
