@@ -11,6 +11,8 @@ app.set('trust proxy', true);
 const PORT = process.env.PORT || 3000;
 const PRINT_TOKEN = process.env.PRINT_TOKEN || 'changeme123';
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'firozahmedshoykot44@gmail.com').toLowerCase();
+const RATE_COLOR_BDT = 4;
+const RATE_BW_BDT = 3;
 const PPD_PATH = '/etc/cups/ppd/epson_l3210.ppd';
 const JOBS_DIR = '/tmp/jobs';
 const UPLOADS_DIR = '/tmp/uploads';
@@ -54,8 +56,13 @@ const upload = multer({
 });
 
 const jobs = [];
+const memoryUserDues = {}; // uid -> { dueColorPages, dueBwPages }
 let lastEspSeen = 0;
 let espPrinterStatus = 'Unknown';
+
+function computeDueBdt(colorPages, bwPages) {
+  return (Number(colorPages || 0) * RATE_COLOR_BDT) + (Number(bwPages || 0) * RATE_BW_BDT);
+}
 
 // ESP32-S3 & Laptop Relay token middleware
 function requireDeviceToken(req, res, next) {
@@ -237,6 +244,7 @@ async function saveJobToFirestore(job) {
       pagesPerCopy: job.pagesPerCopy,
       copies: job.copies,
       totalPages: job.totalPages,
+      costBdt: job.costBdt,
       paper: job.paper,
       orientation: job.orientation,
       quality: job.quality,
@@ -253,6 +261,12 @@ async function saveJobToFirestore(job) {
 }
 
 async function updateJobStatusInFirestore(job, ok) {
+  if (ok && job.uid) {
+    if (!memoryUserDues[job.uid]) memoryUserDues[job.uid] = { dueColorPages: 0, dueBwPages: 0 };
+    if (job.colorMode === 'Color') memoryUserDues[job.uid].dueColorPages += job.totalPages;
+    else memoryUserDues[job.uid].dueBwPages += job.totalPages;
+  }
+
   if (!db) return;
   try {
     await db.collection('print_jobs').doc(job.id).update({
@@ -263,8 +277,8 @@ async function updateJobStatusInFirestore(job, ok) {
       const inc = admin.firestore.FieldValue.increment;
       const colorInc = job.colorMode === 'Color' ? job.totalPages : 0;
       const bwInc = job.colorMode === 'B&W' ? job.totalPages : 0;
+      const costInc = computeDueBdt(colorInc, bwInc);
 
-      // Global summary
       await db.collection('stats').doc('summary').set({
         totalJobs: inc(1),
         totalPages: inc(job.totalPages),
@@ -273,7 +287,6 @@ async function updateJobStatusInFirestore(job, ok) {
         updatedAt: admin.firestore.FieldValue.serverTimestamp()
       }, { merge: true });
 
-      // Per-user summary
       if (job.uid) {
         await db.collection('users').doc(job.uid).set({
           uid: job.uid,
@@ -283,6 +296,9 @@ async function updateJobStatusInFirestore(job, ok) {
           totalPages: inc(job.totalPages),
           colorPages: inc(colorInc),
           bwPages: inc(bwInc),
+          dueColorPages: inc(colorInc),
+          dueBwPages: inc(bwInc),
+          dueAmountBdt: inc(costInc),
           lastDevice: job.device,
           lastIp: job.ip,
           lastPrintAt: job.createdAt
@@ -296,19 +312,49 @@ async function updateJobStatusInFirestore(job, ok) {
 
 app.use(express.static(path.join(__dirname, 'public')));
 
-// Public endpoint so the frontend can initialize Firebase Google Sign-In
 app.get('/api/public-config', (req, res) => {
   res.json({
     firebaseConfig: webConfig,
-    firestoreEnabled: Boolean(db)
+    firestoreEnabled: Boolean(db),
+    rates: { colorBdt: RATE_COLOR_BDT, bwBdt: RATE_BW_BDT }
   });
 });
 
-// Register/sync logged-in Google user and return their role
 app.post('/api/me', requireGoogleUser, async (req, res) => {
   const devInfo = parseDeviceInfo(req);
   await upsertUserOnLogin(req.user, devInfo);
   res.json({ user: req.user });
+});
+
+// Admin endpoint: Reset a user's unpaid due after payment is received
+app.post('/api/admin/reset-due', requireGoogleUser, express.json(), async (req, res) => {
+  if (!req.user.isAdmin) {
+    return res.status(403).json({ error: 'Only Admin can reset user dues' });
+  }
+  const targetUid = req.body && req.body.uid;
+  if (!targetUid) {
+    return res.status(400).json({ error: 'Missing user uid' });
+  }
+
+  memoryUserDues[targetUid] = { dueColorPages: 0, dueBwPages: 0 };
+
+  if (db) {
+    try {
+      await db.collection('users').doc(targetUid).set({
+        dueColorPages: 0,
+        dueBwPages: 0,
+        dueAmountBdt: 0,
+        dueResetFlag: true,
+        lastPaidAt: new Date().toISOString(),
+        lastPaidBy: req.user.email
+      }, { merge: true });
+    } catch (err) {
+      return res.status(500).json({ error: `Failed to reset due in Firestore: ${err.message}` });
+    }
+  }
+
+  console.log(`[Admin] Reset due for uid=${targetUid} by ${req.user.email}`);
+  res.json({ ok: true });
 });
 
 app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req, res) => {
@@ -349,6 +395,7 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
     return res.status(400).json({ error: 'No pages matched your selected page filter.' });
   }
   const totalPages = pagesPerCopy * copies;
+  const costBdt = colorMode === 'Color' ? (totalPages * RATE_COLOR_BDT) : (totalPages * RATE_BW_BDT);
   const devInfo = parseDeviceInfo(req);
 
   const cupsOpts = [
@@ -433,6 +480,7 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
       pagesPerCopy,
       copies,
       totalPages,
+      costBdt,
       paper,
       orientation,
       quality,
@@ -445,8 +493,8 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
     };
     jobs.push(job);
     await saveJobToFirestore(job);
-    console.log(`[Queue] Job ${jobId} by ${req.user.email} (${totalPages}p ${colorMode})`);
-    return res.json({ ok: true, job: { id: job.id, name: job.name, size: job.size, totalPages, colorMode, status: job.status } });
+    console.log(`[Queue] Job ${jobId} by ${req.user.email} (${totalPages}p ${colorMode}, ${costBdt} BDT)`);
+    return res.json({ ok: true, job: { id: job.id, name: job.name, size: job.size, totalPages, colorMode, costBdt, status: job.status } });
   } catch (e) {
     cleanup();
     return res.status(500).json({ error: `Conversion exception: ${e.message}` });
@@ -480,6 +528,7 @@ app.post('/api/print-raw', requireDeviceToken, express.raw({ type: '*/*', limit:
     pagesPerCopy: 1,
     copies: 1,
     totalPages: 1,
+    costBdt: RATE_COLOR_BDT,
     paper: 'A4',
     orientation: 'portrait',
     quality: 'Driver',
@@ -495,7 +544,7 @@ app.post('/api/print-raw', requireDeviceToken, express.raw({ type: '*/*', limit:
   res.json({ ok: true, jobId, size: job.size });
 });
 
-// ESP32-S3 endpoints (authenticated with PRINT_TOKEN)
+// ESP32-S3 endpoints
 app.get('/api/esp/poll', requireDeviceToken, (req, res) => {
   lastEspSeen = Date.now();
   if (req.query.status) {
@@ -525,12 +574,23 @@ app.post('/api/esp/job/:id/done', requireDeviceToken, express.json(), async (req
   res.json({ ok: true });
 });
 
-// Dashboard status: strictly scoped by user role (Admin sees all; regular users see ONLY their own)
+// Resolve due amount for a user record (supports existing users before dueResetFlag existed)
+function resolveUserDueBdt(u) {
+  if (typeof u.dueAmountBdt === 'number') {
+    return u.dueAmountBdt;
+  }
+  if (u.dueResetFlag) {
+    return computeDueBdt(u.dueColorPages || 0, u.dueBwPages || 0);
+  }
+  return computeDueBdt(u.colorPages || 0, u.bwPages || 0);
+}
+
+// Dashboard status: strictly scoped by user role
 app.get('/api/status', requireGoogleUser, async (req, res) => {
   const espOnline = (Date.now() - lastEspSeen) < 15000;
   const isAdmin = req.user.isAdmin;
 
-  let summary = { totalJobs: 0, totalPages: 0, colorPages: 0, bwPages: 0 };
+  let summary = { totalJobs: 0, totalPages: 0, colorPages: 0, bwPages: 0, dueAmountBdt: 0 };
   let recentJobs = [];
   let allUsers = [];
 
@@ -540,12 +600,10 @@ app.get('/api/status', requireGoogleUser, async (req, res) => {
         const sumDoc = await db.collection('stats').doc('summary').get();
         if (sumDoc.exists) {
           const d = sumDoc.data();
-          summary = {
-            totalJobs: d.totalJobs || 0,
-            totalPages: d.totalPages || 0,
-            colorPages: d.colorPages || 0,
-            bwPages: d.bwPages || 0
-          };
+          summary.totalJobs = d.totalJobs || 0;
+          summary.totalPages = d.totalPages || 0;
+          summary.colorPages = d.colorPages || 0;
+          summary.bwPages = d.bwPages || 0;
         }
 
         const jobsSnap = await db.collection('print_jobs').orderBy('timestamp', 'desc').limit(30).get();
@@ -556,18 +614,24 @@ app.get('/api/status', requireGoogleUser, async (req, res) => {
             name: d.name,
             userEmail: d.userEmail || '',
             device: d.device || d.source,
-            ip: d.ip || '',
             colorMode: d.colorMode || 'Color',
             totalPages: d.totalPages || 1,
+            costBdt: typeof d.costBdt === 'number'
+              ? d.costBdt
+              : computeDueBdt(d.colorMode === 'Color' ? (d.totalPages || 1) : 0, d.colorMode === 'B&W' ? (d.totalPages || 1) : 0),
             status: d.status,
             createdAt: d.createdAt
           };
         });
 
         const usersSnap = await db.collection('users').get();
+        let totalUnpaidBdt = 0;
         allUsers = usersSnap.docs.map(doc => {
           const u = doc.data();
+          const dueBdt = resolveUserDueBdt(u);
+          totalUnpaidBdt += dueBdt;
           return {
+            uid: u.uid || doc.id,
             email: u.email || '',
             name: u.name || '',
             role: u.role || 'user',
@@ -575,12 +639,12 @@ app.get('/api/status', requireGoogleUser, async (req, res) => {
             totalPages: u.totalPages || 0,
             colorPages: u.colorPages || 0,
             bwPages: u.bwPages || 0,
-            lastDevice: u.lastDevice || '—',
-            lastIp: u.lastIp || ''
+            dueAmountBdt: dueBdt,
+            lastDevice: u.lastDevice || '—'
           };
-        }).sort((a, b) => b.totalPages - a.totalPages);
+        }).sort((a, b) => (b.dueAmountBdt - a.dueAmountBdt) || (b.totalPages - a.totalPages));
+        summary.dueAmountBdt = totalUnpaidBdt;
       } else {
-        // Regular user: read ONLY their own summary & their own jobs (no composite index needed)
         const userDoc = await db.collection('users').doc(req.user.uid).get();
         if (userDoc.exists) {
           const u = userDoc.data();
@@ -588,7 +652,8 @@ app.get('/api/status', requireGoogleUser, async (req, res) => {
             totalJobs: u.totalJobs || 0,
             totalPages: u.totalPages || 0,
             colorPages: u.colorPages || 0,
-            bwPages: u.bwPages || 0
+            bwPages: u.bwPages || 0,
+            dueAmountBdt: resolveUserDueBdt(u)
           };
         }
 
@@ -601,6 +666,9 @@ app.get('/api/status', requireGoogleUser, async (req, res) => {
               name: d.name,
               colorMode: d.colorMode || 'Color',
               totalPages: d.totalPages || 1,
+              costBdt: typeof d.costBdt === 'number'
+                ? d.costBdt
+                : computeDueBdt(d.colorMode === 'Color' ? (d.totalPages || 1) : 0, d.colorMode === 'B&W' ? (d.totalPages || 1) : 0),
               status: d.status,
               createdAt: d.createdAt
             };
@@ -622,12 +690,15 @@ app.get('/api/status', requireGoogleUser, async (req, res) => {
         else summary.bwPages += j.totalPages;
       }
     }
+    const memDue = memoryUserDues[req.user.uid] || { dueColorPages: 0, dueBwPages: 0 };
+    summary.dueAmountBdt = computeDueBdt(memDue.dueColorPages, memDue.dueBwPages);
   }
 
   res.json({
     espOnline,
     espPrinterStatus: espOnline ? espPrinterStatus : 'Offline',
     user: req.user,
+    rates: { colorBdt: RATE_COLOR_BDT, bwBdt: RATE_BW_BDT },
     summary,
     jobs: recentJobs,
     allUsers: isAdmin ? allUsers : []
