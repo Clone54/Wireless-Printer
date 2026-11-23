@@ -559,14 +559,61 @@ app.post('/api/print-raw', requireDeviceToken, express.raw({ type: '*/*', limit:
   res.json({ ok: true, jobId, size: job.size });
 });
 
+// Auto-recover jobs stuck in 'printing' > 2 minutes without stream activity
+function recoverStuckJobs() {
+  const now = Date.now();
+  for (const j of jobs) {
+    if (j.status === 'printing' && j.printingAt && (now - j.printingAt > 120000)) {
+      j.retries = (j.retries || 0) + 1;
+      if (j.retries <= 2 && fs.existsSync(j.filePath)) {
+        j.status = 'queued';
+        console.log(`[Queue] Re-queued stalled job ${j.id} (retry ${j.retries})`);
+      } else {
+        j.status = 'failed';
+        if (fs.existsSync(j.filePath)) fs.unlink(j.filePath, () => {});
+        updateJobStatusInFirestore(j, false);
+        console.log(`[Queue] Marked stalled job ${j.id} as failed`);
+      }
+    }
+  }
+}
+
+app.post('/api/jobs/:id/cancel', requireGoogleUser, async (req, res) => {
+  const jobId = req.params.id;
+  const memJob = jobs.find(j => j.id === jobId);
+  if (memJob) {
+    if (!req.user.isAdmin && memJob.uid !== req.user.uid) {
+      return res.status(403).json({ error: 'Not allowed' });
+    }
+    memJob.status = 'cancelled';
+    if (fs.existsSync(memJob.filePath)) fs.unlink(memJob.filePath, () => {});
+  }
+  if (db) {
+    try {
+      const docRef = db.collection('print_jobs').doc(jobId);
+      const snap = await docRef.get();
+      if (snap.exists) {
+        const d = snap.data();
+        if (!req.user.isAdmin && d.uid !== req.user.uid) {
+          return res.status(403).json({ error: 'Not allowed' });
+        }
+        await docRef.update({ status: 'cancelled' });
+      }
+    } catch (e) {}
+  }
+  res.json({ ok: true });
+});
+
 app.get('/api/esp/poll', requireDeviceToken, (req, res) => {
   lastEspSeen = Date.now();
   if (req.query.status) {
     espPrinterStatus = String(req.query.status).slice(0, 40);
   }
+  recoverStuckJobs();
   const nextJob = jobs.find(j => j.status === 'queued');
   if (!nextJob) return res.status(204).end();
   nextJob.status = 'printing';
+  nextJob.printingAt = Date.now();
   res.json({ id: nextJob.id, size: nextJob.size, name: nextJob.name });
 });
 
@@ -577,7 +624,7 @@ app.get('/api/esp/job/:id', requireDeviceToken, (req, res) => {
   res.setHeader('Content-Type', 'application/octet-stream');
   res.setHeader('Content-Length', job.size);
   const stream = fs.createReadStream(job.filePath);
-  stream.on('data', () => { lastEspSeen = Date.now(); });
+  stream.on('data', () => { lastEspSeen = Date.now(); job.printingAt = Date.now(); });
   stream.pipe(res);
 });
 
@@ -619,8 +666,18 @@ app.get('/api/status', requireGoogleUser, async (req, res) => {
         }
 
         const jobsSnap = await db.collection('print_jobs').orderBy('timestamp', 'desc').limit(30).get();
+        const activeIds = new Set(jobs.map(j => j.id));
+        const tenMinAgo = Date.now() - 10 * 60 * 1000;
         recentJobs = jobsSnap.docs.map(doc => {
           const d = doc.data();
+          let st = d.status;
+          if ((st === 'queued' || st === 'printing') && !activeIds.has(d.jobId || doc.id)) {
+            const ts = d.createdAt ? Date.parse(d.createdAt) : 0;
+            if (ts && ts < tenMinAgo) {
+              st = 'expired';
+              doc.ref.update({ status: 'expired' }).catch(() => {});
+            }
+          }
           return {
             id: d.jobId || doc.id,
             name: d.name,
@@ -631,7 +688,7 @@ app.get('/api/status', requireGoogleUser, async (req, res) => {
             costBdt: typeof d.costBdt === 'number'
               ? d.costBdt
               : computeDueBdt(d.colorMode === 'Color' ? (d.totalPages || 1) : 0, d.colorMode === 'B&W' ? (d.totalPages || 1) : 0),
-            status: d.status,
+            status: st,
             createdAt: d.createdAt
           };
         });

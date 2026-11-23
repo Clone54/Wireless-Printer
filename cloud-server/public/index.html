@@ -574,6 +574,18 @@
       await firebase.auth().signOut();
     }
 
+    async function cancelJob(jobId) {
+      if (!currentUser) return;
+      try {
+        const idToken = await currentUser.getIdToken();
+        await fetch(`/api/jobs/${jobId}/cancel`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${idToken}` }
+        });
+        refreshStatus();
+      } catch (e) {}
+    }
+
     async function resetUserDue(uid, nameOrEmail) {
       if (!currentUser || !isAdmin) return;
       if (!confirm(`Mark ${nameOrEmail}'s due as paid and reset to 0 BDT?`)) return;
@@ -843,7 +855,7 @@
                 <td><span class="pill ${isColor ? 'pill-color' : 'pill-bw'}">${j.colorMode || 'Color'}</span></td>
                 <td>${j.totalPages || 1}</td>
                 <td style="color:#fbbf24;font-weight:600;">${costStr}</td>
-                <td><span class="pill pill-status">${j.status}</span></td>
+                <td><span class="pill pill-status">${j.status}</span>${(j.status === 'queued' || j.status === 'printing') ? ` <button class="btn-ghost" style="padding:2px 7px;font-size:11px;margin-left:4px;" onclick="cancelJob('${j.id}')">Cancel</button>` : ''}</td>
                 <td style="color:#94a3b8;font-size:12px;">${timeStr}</td>
               </tr>`;
             }
@@ -852,7 +864,7 @@
               <td><span class="pill ${isColor ? 'pill-color' : 'pill-bw'}">${j.colorMode || 'Color'}</span></td>
               <td>${j.totalPages || 1}</td>
               <td style="color:#fbbf24;font-weight:600;">${costStr}</td>
-              <td><span class="pill pill-status">${j.status}</span></td>
+              <td><span class="pill pill-status">${j.status}</span>${(j.status === 'queued' || j.status === 'printing') ? ` <button class="btn-ghost" style="padding:2px 7px;font-size:11px;margin-left:4px;" onclick="cancelJob('${j.id}')">Cancel</button>` : ''}</td>
               <td style="color:#94a3b8;font-size:12px;">${timeStr}</td>
             </tr>`;
           }).join('');
