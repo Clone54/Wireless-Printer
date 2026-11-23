@@ -56,7 +56,7 @@ const upload = multer({
 });
 
 const jobs = [];
-const memoryUserDues = {}; // uid -> { dueColorPages, dueBwPages }
+const memoryUserDues = {};
 let lastEspSeen = 0;
 let espPrinterStatus = 'Unknown';
 
@@ -64,7 +64,15 @@ function computeDueBdt(colorPages, bwPages) {
   return (Number(colorPages || 0) * RATE_COLOR_BDT) + (Number(bwPages || 0) * RATE_BW_BDT);
 }
 
-// ESP32-S3 & Laptop Relay token middleware
+function decodeFilename(name) {
+  if (!name) return 'Document';
+  try {
+    return Buffer.from(name, 'latin1').toString('utf8');
+  } catch {
+    return name;
+  }
+}
+
 function requireDeviceToken(req, res, next) {
   const token = req.headers['x-print-token'] || req.query.token;
   if (!token || token !== PRINT_TOKEN) {
@@ -73,7 +81,6 @@ function requireDeviceToken(req, res, next) {
   next();
 }
 
-// Google Sign-In Firebase ID Token middleware for web users
 async function requireGoogleUser(req, res, next) {
   if (!admin) {
     return res.status(500).json({ error: 'Firebase Admin not configured on server' });
@@ -242,6 +249,7 @@ async function saveJobToFirestore(job) {
       ip: job.ip,
       colorMode: job.colorMode,
       pagesPerCopy: job.pagesPerCopy,
+      pagesPerSheet: job.pagesPerSheet,
       copies: job.copies,
       totalPages: job.totalPages,
       costBdt: job.costBdt,
@@ -327,7 +335,6 @@ app.post('/api/me', requireGoogleUser, async (req, res) => {
   res.json({ user: req.user });
 });
 
-// Admin endpoint: Reset a user's unpaid due after payment is received
 app.post('/api/admin/reset-due', requireGoogleUser, express.json(), async (req, res) => {
   if (!req.user.isAdmin) {
     return res.status(403).json({ error: 'Only Admin can reset user dues' });
@@ -363,7 +370,8 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
     return res.status(400).json({ error: 'No file uploaded' });
   }
 
-  const ext = path.extname(req.file.originalname || '').toLowerCase() || '.pdf';
+  const originalName = decodeFilename(req.file.originalname);
+  const ext = path.extname(originalName).toLowerCase() || '.pdf';
   const inputPath = `${req.file.path}${ext}`;
   fs.renameSync(req.file.path, inputPath);
 
@@ -378,11 +386,14 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
 
   const jobId = crypto.randomBytes(6).toString('hex');
   const outPath = path.join(JOBS_DIR, `${jobId}.prn`);
-  const paper = req.body.paper === 'Letter' ? 'Letter' : 'A4';
+  const paper = ['A4', 'A5', 'Letter'].includes(req.body.paper) ? req.body.paper : 'A4';
   const isGray = (req.body.color === 'Gray' || req.body.color === 'MONO');
   const ink = isGray ? 'MONO' : 'COLOR';
   const colorMode = isGray ? 'B&W' : 'Color';
   const copies = Math.max(1, Math.min(20, parseInt(req.body.copies || '1', 10) || 1));
+  const pagesPerSheet = [1, 2, 4, 6, 9, 16].includes(parseInt(req.body.pagesPerSheet, 10))
+    ? parseInt(req.body.pagesPerSheet, 10)
+    : 1;
   const orientation = req.body.orientation === 'landscape' ? 'landscape' : 'portrait';
   const pageMode = req.body.pageMode || 'all';
   const customPages = String(req.body.customPages || '').replace(/[^0-9,\-]/g, '');
@@ -390,12 +401,13 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
     ? req.body.quality
     : 'PLAIN_NORMAL';
 
-  const pagesPerCopy = await countSelectedPages(inputPath, ext, pageMode, customPages);
-  if (pagesPerCopy === 0) {
+  const selectedPages = await countSelectedPages(inputPath, ext, pageMode, customPages);
+  if (selectedPages === 0) {
     cleanup();
     return res.status(400).json({ error: 'No pages matched your selected page filter.' });
   }
-  const totalPages = pagesPerCopy * copies;
+  const sheetsPerCopy = Math.ceil(selectedPages / pagesPerSheet);
+  const totalPages = sheetsPerCopy * copies;
   const costBdt = colorMode === 'Color' ? (totalPages * RATE_COLOR_BDT) : (totalPages * RATE_BW_BDT);
   const devInfo = parseDeviceInfo(req);
 
@@ -408,6 +420,7 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
   ];
 
   if (orientation === 'landscape') cupsOpts.push('-o', 'landscape');
+  if (pagesPerSheet > 1) cupsOpts.push('-o', `number-up=${pagesPerSheet}`);
   if (pageMode === 'odd') cupsOpts.push('-o', 'page-set=odd');
   else if (pageMode === 'even') cupsOpts.push('-o', 'page-set=even');
   else if (pageMode === 'custom' && customPages) cupsOpts.push('-o', `page-ranges=${customPages}`);
@@ -452,7 +465,7 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
       if (rasterBuf && rasterBuf.length >= 64) {
         const wrapRes = await runFilter(
           '/usr/lib/cups/filter/epson-escpr-wrapper',
-          ['1', 'root', req.file.originalname || 'Job', String(copies), optsStr],
+          ['1', 'root', originalName, String(copies), optsStr],
           rasterBuf, envVars
         );
         finalBuf = wrapRes.stdout;
@@ -473,12 +486,13 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
       uid: req.user.uid,
       userEmail: req.user.email,
       userName: req.user.name,
-      name: req.file.originalname || 'Document',
+      name: originalName,
       source: 'Web/Phone',
       device: devInfo.device,
       ip: devInfo.ip,
       colorMode,
-      pagesPerCopy,
+      pagesPerCopy: sheetsPerCopy,
+      pagesPerSheet,
       copies,
       totalPages,
       costBdt,
@@ -502,7 +516,6 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
   }
 });
 
-// Laptop Relay (authenticated with PRINT_TOKEN, attributed to admin)
 app.post('/api/print-raw', requireDeviceToken, express.raw({ type: '*/*', limit: '50mb' }), async (req, res) => {
   if (!req.body || req.body.length === 0) {
     return res.status(400).json({ error: 'Empty print payload' });
@@ -527,6 +540,7 @@ app.post('/api/print-raw', requireDeviceToken, express.raw({ type: '*/*', limit:
     ip: devInfo.ip,
     colorMode: 'Color',
     pagesPerCopy: 1,
+    pagesPerSheet: 1,
     copies: 1,
     totalPages: 1,
     costBdt: RATE_COLOR_BDT,
@@ -545,7 +559,6 @@ app.post('/api/print-raw', requireDeviceToken, express.raw({ type: '*/*', limit:
   res.json({ ok: true, jobId, size: job.size });
 });
 
-// ESP32-S3 endpoints
 app.get('/api/esp/poll', requireDeviceToken, (req, res) => {
   lastEspSeen = Date.now();
   if (req.query.status) {
@@ -558,11 +571,11 @@ app.get('/api/esp/poll', requireDeviceToken, (req, res) => {
 });
 
 app.get('/api/esp/job/:id', requireDeviceToken, (req, res) => {
+  lastEspSeen = Date.now();
   const job = jobs.find(j => j.id === req.params.id);
   if (!job || !fs.existsSync(job.filePath)) return res.status(404).end();
   res.setHeader('Content-Type', 'application/octet-stream');
   res.setHeader('Content-Length', job.size);
-  lastEspSeen = Date.now();
   const stream = fs.createReadStream(job.filePath);
   stream.on('data', () => { lastEspSeen = Date.now(); });
   stream.pipe(res);
@@ -579,18 +592,12 @@ app.post('/api/esp/job/:id/done', requireDeviceToken, express.json(), async (req
   res.json({ ok: true });
 });
 
-// Resolve due amount for a user record (supports existing users before dueResetFlag existed)
 function resolveUserDueBdt(u) {
-  if (typeof u.dueAmountBdt === 'number') {
-    return u.dueAmountBdt;
-  }
-  if (u.dueResetFlag) {
-    return computeDueBdt(u.dueColorPages || 0, u.dueBwPages || 0);
-  }
+  if (typeof u.dueAmountBdt === 'number') return u.dueAmountBdt;
+  if (u.dueResetFlag) return computeDueBdt(u.dueColorPages || 0, u.dueBwPages || 0);
   return computeDueBdt(u.colorPages || 0, u.bwPages || 0);
 }
 
-// Dashboard status: strictly scoped by user role
 app.get('/api/status', requireGoogleUser, async (req, res) => {
   const espOnline = (Date.now() - lastEspSeen) < 15000;
   const isAdmin = req.user.isAdmin;

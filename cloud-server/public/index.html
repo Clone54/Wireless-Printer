@@ -7,6 +7,7 @@
   <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
   <script src="https://accounts.google.com/gsi/client" async defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
   <style>
     :root {
       --bg: #0b1120;
@@ -40,18 +41,15 @@
       padding: 6px 14px; border-radius: 999px; font-size: 12px; color: #cbd5e1; margin-bottom: 18px;
     }
     .rate-banner b { color: #38bdf8; }
-
     .workflow-stage {
       background: var(--card-2); border: 1px solid var(--border); border-radius: 14px;
       padding: 16px 14px; margin-bottom: 20px; position: relative; overflow: hidden;
     }
-    .steps-track {
-      display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; position: relative; z-index: 2;
-    }
+    .steps-track { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; position: relative; z-index: 2; }
     @media (max-width: 520px) { .steps-track { grid-template-columns: repeat(2, 1fr); } }
     .wf-step {
       background: #131c31; border: 1px solid var(--border); border-radius: 11px;
-      padding: 12px 8px; transition: all 0.35s ease; opacity: 0.48; transform: translateY(0);
+      padding: 12px 8px; transition: all 0.35s ease; opacity: 0.48;
       display: flex; flex-direction: column; align-items: center; gap: 6px;
     }
     .wf-step.active {
@@ -67,17 +65,9 @@
     .wf-num { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: #60a5fa; }
     .wf-title { font-size: 12.5px; font-weight: 600; color: var(--text); }
     .wf-desc { font-size: 11px; color: var(--muted); line-height: 1.35; }
-    .wf-progress {
-      height: 4px; background: #1e293b; border-radius: 4px; margin-top: 14px; overflow: hidden;
-    }
-    .wf-progress-bar {
-      height: 100%; width: 25%; background: linear-gradient(90deg, #3b82f6, #22c55e);
-      border-radius: 4px; transition: width 0.45s ease;
-    }
-    @keyframes popPulse {
-      0%, 100% { transform: scale(1); }
-      50% { transform: scale(1.08); }
-    }
+    .wf-progress { height: 4px; background: #1e293b; border-radius: 4px; margin-top: 14px; overflow: hidden; }
+    .wf-progress-bar { height: 100%; width: 25%; background: linear-gradient(90deg, #3b82f6, #22c55e); border-radius: 4px; transition: width 0.45s ease; }
+    @keyframes popPulse { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.08); } }
 
     .btn-google {
       width: 100%; padding: 12px 16px; border-radius: 10px; border: 1px solid #cbd5e1;
@@ -88,7 +78,7 @@
     .btn-google:disabled { opacity: 0.6; cursor: not-allowed; }
 
     /* --- Main Dashboard --- */
-    .container { width: 100%; max-width: 1100px; display: flex; flex-direction: column; gap: 16px; }
+    .container { width: 100%; max-width: 1120px; display: flex; flex-direction: column; gap: 16px; }
     .header {
       background: var(--card); border: 1px solid var(--border); border-radius: 14px;
       padding: 16px 20px; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 12px;
@@ -120,8 +110,8 @@
     .stat-val { font-size: 23px; font-weight: 700; margin-top: 4px; }
     .stat-note { font-size: 11px; color: var(--muted); margin-top: 3px; }
 
-    .grid { display: grid; grid-template-columns: 1.05fr 1fr; gap: 16px; align-items: start; }
-    @media (max-width: 820px) { .grid { grid-template-columns: 1fr; } }
+    .grid { display: grid; grid-template-columns: 1.1fr 1fr; gap: 16px; align-items: start; }
+    @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
     .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
     .section-title { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 12px; }
     label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 6px; text-align: left; }
@@ -134,25 +124,54 @@
     .row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; }
     .dropzone {
       border: 2px dashed var(--border); border-radius: 12px; padding: 18px; text-align: center;
-      background: var(--card-2); cursor: pointer; transition: border-color 0.2s;
+      background: var(--card-2); cursor: pointer; transition: all 0.2s;
     }
-    .dropzone:hover { border-color: var(--accent); }
-    .dropzone.dragover {
-      border-color: var(--accent);
-      background: rgba(59, 130, 246, 0.14);
-    }
+    .dropzone:hover, .dropzone.dragover { border-color: var(--accent); background: rgba(59, 130, 246, 0.14); }
     .dropzone input[type="file"] { display: none; }
     .file-meta { font-size: 12px; color: var(--muted); margin-top: 6px; }
-    .preview-box {
-      margin-top: 14px; background: #070b14; border: 1px solid var(--border); border-radius: 10px;
-      min-height: 320px; display: flex; flex-direction: column; align-items: center; justify-content: center;
-      overflow: hidden; position: relative; padding: 12px;
+
+    /* Universal Sheet Preview Box (PC + Mobile) */
+    .preview-header {
+      display: flex; justify-content: space-between; align-items: center; margin-top: 12px; font-size: 12px; color: var(--muted);
     }
-    .preview-box img { max-width: 100%; max-height: 400px; object-fit: contain; border-radius: 6px; transition: transform 0.25s ease; }
-    .preview-box img.landscape-sim { transform: rotate(90deg) scale(0.78); }
-    .preview-box iframe { width: 100%; height: 420px; border: none; border-radius: 6px; background: #fff; }
-    .preview-empty { color: var(--muted); font-size: 13px; text-align: center; padding: 24px; }
-    .btn-primary { background: var(--accent) !important; border: none !important; font-weight: 600; cursor: pointer; margin-top: 16px; padding: 12px; }
+    .preview-box {
+      margin-top: 8px; background: #070b14; border: 1px solid var(--border); border-radius: 10px;
+      height: 440px; overflow-y: auto; padding: 14px;
+      display: flex; flex-direction: column; align-items: center; gap: 14px;
+    }
+    .preview-empty { color: var(--muted); font-size: 13px; text-align: center; margin: auto; padding: 24px; }
+    .sheet-frame {
+      background: #ffffff; border-radius: 4px; box-shadow: 0 6px 20px rgba(0,0,0,0.45);
+      padding: 8px; display: grid; gap: 6px; flex-shrink: 0; position: relative;
+      max-width: 100%;
+    }
+    .sheet-frame.bw-sim canvas, .sheet-frame.bw-sim img { filter: grayscale(100%); }
+    .sheet-cell {
+      width: 100%; height: 100%; display: flex; align-items: center; justify-content: center;
+      overflow: hidden; background: #fff;
+    }
+    .sheet-cell canvas, .sheet-cell img { max-width: 100%; max-height: 100%; object-fit: contain; display: block; }
+    .sheet-label {
+      font-size: 11px; color: #94a3b8; margin-top: -8px;
+    }
+
+    /* More Settings Collapsible */
+    details.more-settings {
+      margin-top: 14px; background: var(--card-2); border: 1px solid var(--border);
+      border-radius: 10px; padding: 10px 12px;
+    }
+    details.more-settings summary {
+      cursor: pointer; font-size: 13px; font-weight: 600; color: #93c5fd; list-style: none;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    details.more-settings summary::-webkit-details-marker { display: none; }
+    .estimate-bar {
+      margin-top: 14px; padding: 10px 12px; border-radius: 9px; background: rgba(59,130,246,0.1);
+      border: 1px solid rgba(59,130,246,0.28); font-size: 13px; color: #bfdbfe;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+
+    .btn-primary { background: var(--accent) !important; border: none !important; font-weight: 600; cursor: pointer; margin-top: 14px; padding: 12px; }
     .btn-primary:hover { background: var(--accent-hover) !important; }
     .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
     #msg, #loginErr { margin-top: 12px; font-size: 13px; line-height: 1.4; word-break: break-word; }
@@ -173,9 +192,9 @@
 </head>
 <body>
 
-  <!-- Google Sign-In Screen with 4-Step Animated System Process -->
+  <!-- Google Sign-In Screen -->
   <div id="loginScreen" class="login-wrap">
-    <h1>Firoz Printing Cloud Print (Hamid-113)</h1>
+    <h1>Epson L3210 Cloud Print</h1>
     <p id="loginHint">Print PDFs &amp; photos wirelessly from any network in 4 simple steps.</p>
     <div class="rate-banner">
       <span>Color: <b>4 BDT / page</b></span>
@@ -183,7 +202,6 @@
       <span>B&amp;W: <b>3 BDT / page</b></span>
     </div>
 
-    <!-- Animated 4-Step Workflow Showcase -->
     <div class="workflow-stage">
       <div class="steps-track">
         <div class="wf-step active" id="wfStep0">
@@ -202,7 +220,7 @@
           <div class="wf-icon">&#9881;&#65039;</div>
           <div class="wf-num">Step 3</div>
           <div class="wf-title">Print Setup</div>
-          <div class="wf-desc">A4/Letter, Portrait or Landscape, Pages, Color/B&amp;W</div>
+          <div class="wf-desc">A4/A5/Letter, Portrait or Landscape, N-up</div>
         </div>
         <div class="wf-step" id="wfStep3">
           <div class="wf-icon">&#128424;&#65039;</div>
@@ -211,9 +229,7 @@
           <div class="wf-desc">ESP32-S3 streams directly to Epson L3210</div>
         </div>
       </div>
-      <div class="wf-progress">
-        <div class="wf-progress-bar" id="wfProgressBar"></div>
-      </div>
+      <div class="wf-progress"><div class="wf-progress-bar" id="wfProgressBar"></div></div>
     </div>
 
     <div id="gisBtnWrap" style="display:flex;justify-content:center;margin-bottom:10px;"></div>
@@ -231,7 +247,7 @@
   <div id="dashboard" class="container hidden">
     <div class="header">
       <div>
-        <h1>Firoz Printing Cloud Print (Hamid-113)</h1>
+        <h1>Epson L3210 Cloud Print</h1>
         <p class="sub" id="userSub">Signed in</p>
       </div>
       <div class="header-right">
@@ -241,7 +257,6 @@
       </div>
     </div>
 
-    <!-- Summary Cards (Including Due Amount in BDT) -->
     <div class="stats-grid">
       <div class="stat-card">
         <div class="stat-label" id="lblTotalPages">Your Total Pages</div>
@@ -267,17 +282,21 @@
     </div>
 
     <div class="grid">
-      <!-- Left: Document & Live Preview -->
+      <!-- Left: Document & Live Sheet Preview -->
       <div class="card">
-        <div class="section-title">1. Document &amp; Preview</div>
+        <div class="section-title">1. Document &amp; Live Sheet Preview</div>
         <div class="dropzone" id="dropzone" onclick="document.getElementById('file').click()">
-          <div style="font-weight: 600; font-size: 14px;">Tap to choose a PDF or Photo</div>
+          <div style="font-weight: 600; font-size: 14px;">Tap or drag &amp; drop a PDF or Photo</div>
           <div class="file-meta" id="fileMeta">Supports PDF, PNG, JPG (max 25 MB)</div>
           <input id="file" type="file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/*" onchange="handleFileSelect()" />
         </div>
 
+        <div class="preview-header">
+          <span id="previewSummary">No file selected</span>
+          <span id="previewLayoutBadge">A4 • Portrait</span>
+        </div>
         <div class="preview-box" id="previewBox">
-          <div class="preview-empty">Select a PDF or photo above to preview it here before printing.</div>
+          <div class="preview-empty">Select or drop a PDF or photo above to preview exact pages, orientation, and pages-per-sheet here.</div>
         </div>
       </div>
 
@@ -288,15 +307,16 @@
         <div class="row-2">
           <div>
             <label for="orientation">Orientation</label>
-            <select id="orientation" onchange="updateOrientationPreview()">
+            <select id="orientation" onchange="renderPreview()">
               <option value="portrait">Portrait</option>
               <option value="landscape">Landscape</option>
             </select>
           </div>
           <div>
             <label for="paper">Paper Size</label>
-            <select id="paper">
+            <select id="paper" onchange="renderPreview()">
               <option value="A4">A4</option>
+              <option value="A5">A5</option>
               <option value="Letter">Letter</option>
             </select>
           </div>
@@ -305,7 +325,7 @@
         <div class="row-3">
           <div>
             <label for="color">Color Mode</label>
-            <select id="color">
+            <select id="color" onchange="renderPreview()">
               <option value="RGB">Color (4 BDT/p)</option>
               <option value="Gray">B&amp;W (3 BDT/p)</option>
             </select>
@@ -320,12 +340,12 @@
           </div>
           <div>
             <label for="copies">Copies</label>
-            <input id="copies" type="number" min="1" max="20" value="1" />
+            <input id="copies" type="number" min="1" max="20" value="1" onchange="updateEstimate()" oninput="updateEstimate()" />
           </div>
         </div>
 
         <label for="pageMode">Pages to Print (PDF)</label>
-        <select id="pageMode" onchange="toggleCustomPages()">
+        <select id="pageMode" onchange="toggleCustomPages(); renderPreview();">
           <option value="all">All Pages</option>
           <option value="odd">Odd Pages Only (1, 3, 5...)</option>
           <option value="even">Even Pages Only (2, 4, 6...)</option>
@@ -334,7 +354,29 @@
 
         <div id="customPagesWrap" class="hidden">
           <label for="customPages">Custom Pages (e.g. 1-3, 5, 8-10)</label>
-          <input id="customPages" type="text" placeholder="1-3, 5" />
+          <input id="customPages" type="text" placeholder="1-3, 5" oninput="renderPreview()" />
+        </div>
+
+        <!-- More Settings Tab -->
+        <details class="more-settings">
+          <summary>
+            <span>More Settings (Pages per sheet)</span>
+            <span style="font-size:11px;color:#94a3b8;" id="moreSummary">1 per sheet</span>
+          </summary>
+          <label for="pagesPerSheet">Pages per Sheet (N-up)</label>
+          <select id="pagesPerSheet" onchange="renderPreview()">
+            <option value="1">1 page per sheet (Normal)</option>
+            <option value="2">2 pages per sheet</option>
+            <option value="4">4 pages per sheet</option>
+            <option value="6">6 pages per sheet</option>
+            <option value="9">9 pages per sheet</option>
+            <option value="16">16 pages per sheet</option>
+          </select>
+        </details>
+
+        <div class="estimate-bar" id="estimateBar">
+          <span id="estText">Select a file to see sheet count</span>
+          <b id="estCost">0 BDT</b>
         </div>
 
         <button class="btn-primary" id="sendBtn" onclick="sendJob()">Send to Printer</button>
@@ -342,7 +384,7 @@
       </div>
     </div>
 
-    <!-- Admin-Only: All Users Breakdown with Total Amount & Reset Button -->
+    <!-- Admin-Only: All Users Breakdown -->
     <div id="adminUsersCard" class="card hidden" style="overflow-x:auto;">
       <div class="section-title">Admin View: All Users &amp; Devices</div>
       <table>
@@ -375,13 +417,20 @@
   </div>
 
   <script>
+    if (window.pdfjsLib) {
+      pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    }
+
     let currentUser = null;
     let isAdmin = false;
-    let currentBlobUrl = null;
+    let currentPdfDoc = null;
+    let currentImgUrl = null;
+    let currentFileIsPdf = false;
+    let totalLoadedPages = 0;
     let statusTimer = null;
     let wfStepIndex = 0;
+    let renderToken = 0;
 
-    // 4-Step Animated Workflow Loop on Sign-In Page
     setInterval(() => {
       wfStepIndex = (wfStepIndex + 1) % 4;
       for (let i = 0; i < 4; i++) {
@@ -425,11 +474,8 @@
         }
 
         firebase.auth().onAuthStateChanged(async (user) => {
-          if (user) {
-            await onSignedIn(user);
-          } else {
-            onSignedOut();
-          }
+          if (user) await onSignedIn(user);
+          else onSignedOut();
         });
       } catch (e) {
         errEl.textContent = 'Failed to load authentication config.';
@@ -444,18 +490,11 @@
       });
       const wrap = document.getElementById('gisBtnWrap');
       if (wrap) {
-        google.accounts.id.renderButton(wrap, {
-          theme: 'outline',
-          size: 'large',
-          width: 320,
-          text: 'continue_with'
-        });
+        google.accounts.id.renderButton(wrap, { theme: 'outline', size: 'large', width: 320, text: 'continue_with' });
         document.getElementById('googleBtn').classList.add('hidden');
         document.getElementById('redirectBtn').classList.add('hidden');
       }
-      if (!firebase.auth().currentUser) {
-        google.accounts.id.prompt();
-      }
+      if (!firebase.auth().currentUser) google.accounts.id.prompt();
     }
 
     async function handleGisCredential(response) {
@@ -465,9 +504,7 @@
       try {
         const cred = firebase.auth.GoogleAuthProvider.credential(response.credential);
         const res = await firebase.auth().signInWithCredential(cred);
-        if (res && res.user) {
-          await onSignedIn(res.user);
-        }
+        if (res && res.user) await onSignedIn(res.user);
       } catch (e) {
         errEl.className = 'msg-err';
         errEl.textContent = `${e.code || 'Error'}: ${e.message || 'Google Sign-In failed.'}`;
@@ -499,10 +536,7 @@
     async function onSignedIn(user) {
       currentUser = user;
       const idToken = await user.getIdToken();
-      const meRes = await fetch('/api/me', {
-        method: 'POST',
-        headers: { 'Authorization': `Bearer ${idToken}` }
-      });
+      const meRes = await fetch('/api/me', { method: 'POST', headers: { 'Authorization': `Bearer ${idToken}` } });
       if (!meRes.ok) {
         document.getElementById('loginErr').textContent = 'Server rejected sign-in.';
         return;
@@ -547,21 +581,11 @@
         const idToken = await currentUser.getIdToken();
         const res = await fetch('/api/admin/reset-due', {
           method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${idToken}`,
-            'Content-Type': 'application/json'
-          },
+          headers: { 'Authorization': `Bearer ${idToken}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ uid })
         });
-        if (res.ok) {
-          refreshStatus();
-        } else {
-          const d = await res.json();
-          alert(d.error || 'Failed to reset due.');
-        }
-      } catch (e) {
-        alert('Network error resetting due.');
-      }
+        if (res.ok) refreshStatus();
+      } catch (e) {}
     }
 
     function toggleCustomPages() {
@@ -569,38 +593,197 @@
       document.getElementById('customPagesWrap').classList.toggle('hidden', mode !== 'custom');
     }
 
-    function updateOrientationPreview() {
-      const img = document.getElementById('previewImg');
-      if (!img) return;
-      img.classList.toggle('landscape-sim', document.getElementById('orientation').value === 'landscape');
+    function getSelectedPageNumbers(total) {
+      if (total <= 0) return [];
+      const mode = document.getElementById('pageMode').value;
+      if (mode === 'odd') {
+        const arr = [];
+        for (let i = 1; i <= total; i += 2) arr.push(i);
+        return arr;
+      }
+      if (mode === 'even') {
+        const arr = [];
+        for (let i = 2; i <= total; i += 2) arr.push(i);
+        return arr;
+      }
+      if (mode === 'custom') {
+        const raw = document.getElementById('customPages').value.trim();
+        if (!raw) return Array.from({ length: total }, (_, i) => i + 1);
+        const set = new Set();
+        for (const part of raw.split(',')) {
+          const r = part.trim().split('-').map(n => parseInt(n, 10));
+          if (r.length === 1 && !isNaN(r[0]) && r[0] >= 1 && r[0] <= total) set.add(r[0]);
+          else if (r.length === 2 && !isNaN(r[0]) && !isNaN(r[1])) {
+            const a = Math.max(1, Math.min(r[0], r[1]));
+            const b = Math.min(total, Math.max(r[0], r[1]));
+            for (let p = a; p <= b; p++) set.add(p);
+          }
+        }
+        return Array.from(set).sort((a, b) => a - b);
+      }
+      return Array.from({ length: total }, (_, i) => i + 1);
     }
 
-    function handleFileSelect() {
+    function getSheetDims(paper, orientation) {
+      const ratios = { A4: 210 / 297, A5: 148 / 210, Letter: 215.9 / 279.4 };
+      const r = ratios[paper] || ratios.A4;
+      if (orientation === 'landscape') {
+        const w = 360;
+        return { w, h: Math.round(w * r) };
+      }
+      const h = 340;
+      return { w: Math.round(h * r), h };
+    }
+
+    function getNupGrid(nUp) {
+      if (nUp === 2) return [2, 1];
+      if (nUp === 4) return [2, 2];
+      if (nUp === 6) return [3, 2];
+      if (nUp === 9) return [3, 3];
+      if (nUp === 16) return [4, 4];
+      return [1, 1];
+    }
+
+    function updateEstimate(selectedCount = null) {
+      const nUp = parseInt(document.getElementById('pagesPerSheet').value, 10) || 1;
+      document.getElementById('moreSummary').textContent = `${nUp} per sheet`;
+
+      const count = selectedCount !== null ? selectedCount : getSelectedPageNumbers(totalLoadedPages).length;
+      if (count <= 0) {
+        document.getElementById('estText').textContent = totalLoadedPages > 0 ? '0 pages match filter' : 'Select a file to see sheet count';
+        document.getElementById('estCost').textContent = '0 BDT';
+        return;
+      }
+      const copies = Math.max(1, Math.min(20, parseInt(document.getElementById('copies').value || '1', 10) || 1));
+      const sheets = Math.ceil(count / nUp) * copies;
+      const isColor = document.getElementById('color').value !== 'Gray';
+      const cost = sheets * (isColor ? 4 : 3);
+      document.getElementById('estText').textContent = `${count} page(s) → ${sheets} physical sheet(s)`;
+      document.getElementById('estCost').textContent = `${cost} BDT`;
+    }
+
+    async function handleFileSelect() {
       const file = document.getElementById('file').files[0];
       const meta = document.getElementById('fileMeta');
       const box = document.getElementById('previewBox');
 
-      if (currentBlobUrl) { URL.revokeObjectURL(currentBlobUrl); currentBlobUrl = null; }
+      if (currentImgUrl) { URL.revokeObjectURL(currentImgUrl); currentImgUrl = null; }
+      currentPdfDoc = null;
+      currentFileIsPdf = false;
+      totalLoadedPages = 0;
+
       if (!file) {
         meta.textContent = 'Supports PDF, PNG, JPG (max 25 MB)';
-        box.innerHTML = '<div class="preview-empty">Select a PDF or photo above to preview it here before printing.</div>';
+        box.innerHTML = '<div class="preview-empty">Select or drop a PDF or photo above to preview it here.</div>';
+        updateEstimate(0);
         return;
       }
 
       meta.textContent = `${file.name} (${(file.size / 1024).toFixed(0)} KB)`;
-      currentBlobUrl = URL.createObjectURL(file);
 
-      if (file.type.startsWith('image/')) {
-        box.innerHTML = `<img id="previewImg" src="${currentBlobUrl}" alt="Preview" />`;
-        updateOrientationPreview();
-      } else if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
-        box.innerHTML = `
-          <iframe src="${currentBlobUrl}#toolbar=0" title="PDF Preview"></iframe>
-          <div style="margin-top:8px;font-size:12px;color:#94a3b8;">
-            On some mobile browsers, <a href="${currentBlobUrl}" target="_blank" style="color:#60a5fa;">tap here to open full PDF preview</a>.
-          </div>`;
+      if (file.type === 'application/pdf' || file.name.toLowerCase().endsWith('.pdf')) {
+        currentFileIsPdf = true;
+        box.innerHTML = '<div class="preview-empty">Rendering PDF preview...</div>';
+        try {
+          const buf = await file.arrayBuffer();
+          currentPdfDoc = await pdfjsLib.getDocument({ data: buf }).promise;
+          totalLoadedPages = currentPdfDoc.numPages;
+          await renderPreview();
+        } catch (err) {
+          box.innerHTML = `<div class="preview-empty">Could not preview PDF (${err.message}). You can still print it.</div>`;
+        }
+      } else if (file.type.startsWith('image/')) {
+        currentImgUrl = URL.createObjectURL(file);
+        totalLoadedPages = 1;
+        await renderPreview();
       } else {
         box.innerHTML = `<div class="preview-empty">Selected: ${file.name}</div>`;
+      }
+    }
+
+    async function renderPreview() {
+      const myToken = ++renderToken;
+      const box = document.getElementById('previewBox');
+      const paper = document.getElementById('paper').value;
+      const orientation = document.getElementById('orientation').value;
+      const isBw = document.getElementById('color').value === 'Gray';
+      const nUp = parseInt(document.getElementById('pagesPerSheet').value, 10) || 1;
+      const [cols, rows] = getNupGrid(nUp);
+      const dims = getSheetDims(paper, orientation);
+
+      document.getElementById('previewLayoutBadge').textContent =
+        `${paper} • ${orientation === 'landscape' ? 'Landscape' : 'Portrait'} • ${nUp}-up`;
+
+      if (totalLoadedPages === 0) {
+        updateEstimate(0);
+        return;
+      }
+
+      const selectedPages = currentFileIsPdf ? getSelectedPageNumbers(totalLoadedPages) : [1];
+      updateEstimate(selectedPages.length);
+
+      if (selectedPages.length === 0) {
+        document.getElementById('previewSummary').textContent = `0 of ${totalLoadedPages} pages selected`;
+        box.innerHTML = '<div class="preview-empty">No pages match this filter (e.g., Even pages on a 1-page PDF).</div>';
+        return;
+      }
+
+      const totalSheets = Math.ceil(selectedPages.length / nUp);
+      document.getElementById('previewSummary').textContent =
+        `Showing ${selectedPages.length} page(s) on ${totalSheets} sheet(s)`;
+
+      box.innerHTML = '';
+      const maxSheetsToRender = Math.min(totalSheets, 12);
+
+      for (let s = 0; s < maxSheetsToRender; s++) {
+        if (myToken !== renderToken) return;
+
+        const sheet = document.createElement('div');
+        sheet.className = 'sheet-frame' + (isBw ? ' bw-sim' : '');
+        sheet.style.width = `${dims.w}px`;
+        sheet.style.height = `${dims.h}px`;
+        sheet.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
+        sheet.style.gridTemplateRows = `repeat(${rows}, 1fr)`;
+
+        const slice = selectedPages.slice(s * nUp, (s + 1) * nUp);
+        for (const pageNum of slice) {
+          const cell = document.createElement('div');
+          cell.className = 'sheet-cell';
+
+          if (currentFileIsPdf && currentPdfDoc) {
+            const page = await currentPdfDoc.getPage(pageNum);
+            if (myToken !== renderToken) return;
+            const vp = page.getViewport({ scale: 1 });
+            const cellW = (dims.w - 16) / cols;
+            const cellH = (dims.h - 16) / rows;
+            const scale = Math.min((cellW * 2) / vp.width, (cellH * 2) / vp.height);
+            const scaledVp = page.getViewport({ scale: Math.max(scale, 0.4) });
+            const canvas = document.createElement('canvas');
+            canvas.width = scaledVp.width;
+            canvas.height = scaledVp.height;
+            await page.render({ canvasContext: canvas.getContext('2d'), viewport: scaledVp }).promise;
+            cell.appendChild(canvas);
+          } else if (currentImgUrl) {
+            const img = document.createElement('img');
+            img.src = currentImgUrl;
+            cell.appendChild(img);
+          }
+          sheet.appendChild(cell);
+        }
+
+        const lbl = document.createElement('div');
+        lbl.className = 'sheet-label';
+        lbl.textContent = `Sheet ${s + 1} (Pages: ${slice.join(', ')})`;
+
+        box.appendChild(sheet);
+        box.appendChild(lbl);
+      }
+
+      if (totalSheets > maxSheetsToRender) {
+        const more = document.createElement('div');
+        more.className = 'sheet-label';
+        more.textContent = `+ ${totalSheets - maxSheetsToRender} more sheet(s) will be printed`;
+        box.appendChild(more);
       }
     }
 
@@ -638,11 +821,7 @@
                   <td>${u.totalJobs}</td>
                   <td>${u.lastDevice || '—'}</td>
                   <td><span class="${due > 0 ? 'due-amount' : 'due-paid'}">${due} BDT</span></td>
-                  <td>
-                    <button class="btn-reset" onclick="resetUserDue('${u.uid}', '${safeLabel}')" ${due === 0 ? 'disabled' : ''}>
-                      Reset
-                    </button>
-                  </td>
+                  <td><button class="btn-reset" onclick="resetUserDue('${u.uid}', '${safeLabel}')" ${due === 0 ? 'disabled' : ''}>Reset</button></td>
                 </tr>`;
               }).join('')
             : '<tr><td colspan="8" class="sub">No users yet.</td></tr>';
@@ -708,6 +887,7 @@
       form.append('orientation', document.getElementById('orientation').value);
       form.append('pageMode', pageMode);
       form.append('customPages', customPages);
+      form.append('pagesPerSheet', document.getElementById('pagesPerSheet').value);
       form.append('copies', document.getElementById('copies').value);
 
       try {
@@ -720,7 +900,7 @@
         const data = await res.json();
         if (res.ok) {
           msg.className = 'msg-ok';
-          msg.textContent = `Queued "${data.job.name}" (${data.job.totalPages}p ${data.job.colorMode} = ${data.job.costBdt} BDT). Printing shortly.`;
+          msg.textContent = `Queued "${data.job.name}" (${data.job.totalPages} sheet(s) ${data.job.colorMode} = ${data.job.costBdt} BDT). Printing shortly.`;
           refreshStatus();
         } else {
           msg.className = 'msg-err';
@@ -733,20 +913,14 @@
         btn.disabled = false;
       }
     }
+
+    // Drag & Drop support
     const dz = document.getElementById('dropzone');
     ['dragenter', 'dragover'].forEach(ev => {
-      dz.addEventListener(ev, (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        dz.classList.add('dragover');
-      });
+      dz.addEventListener(ev, (e) => { e.preventDefault(); e.stopPropagation(); dz.classList.add('dragover'); });
     });
     ['dragleave', 'drop'].forEach(ev => {
-      dz.addEventListener(ev, (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        dz.classList.remove('dragover');
-      });
+      dz.addEventListener(ev, (e) => { e.preventDefault(); e.stopPropagation(); dz.classList.remove('dragover'); });
     });
     dz.addEventListener('drop', (e) => {
       const files = e.dataTransfer && e.dataTransfer.files;
@@ -755,6 +929,7 @@
         handleFileSelect();
       }
     });
+
     initApp();
   </script>
 </body>
