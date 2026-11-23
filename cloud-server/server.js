@@ -629,7 +629,11 @@ app.get('/api/esp/poll', requireDeviceToken, (req, res) => {
   const nextJob = jobs.find(j => j.status === 'queued');
   if (!nextJob) return res.status(204).end();
   nextJob.status = 'printing';
+  nextJob.progress = 0;
   nextJob.printingAt = Date.now();
+  if (db) {
+    db.collection('print_jobs').doc(nextJob.id).update({ status: 'printing' }).catch(() => {});
+  }
   res.json({ id: nextJob.id, size: nextJob.size, name: nextJob.name });
 });
 
@@ -665,7 +669,7 @@ function resolveUserDueBdt(u) {
 function getJobQueueMeta(jobId, status) {
   const idx = jobs.findIndex(j => j.id === jobId);
   if (idx === -1) {
-    return { progress: status === 'completed' ? 100 : 0, waitingPages: 0 };
+    return { status, progress: status === 'completed' ? 100 : 0, waitingPages: 0 };
   }
   const mem = jobs[idx];
   let waitingPages = 0;
@@ -677,6 +681,7 @@ function getJobQueueMeta(jobId, status) {
     }
   }
   return {
+    status: mem.status,
     progress: mem.status === 'completed' ? 100 : (mem.progress || 0),
     waitingPages
   };
