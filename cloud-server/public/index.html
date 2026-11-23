@@ -111,8 +111,9 @@
     .stat-note { font-size: 11px; color: var(--muted); margin-top: 3px; }
 
     .grid { display: grid; grid-template-columns: 1.1fr 1fr; gap: 16px; align-items: start; }
+    .grid > * { min-width: 0; }
     @media (max-width: 860px) { .grid { grid-template-columns: 1fr; } }
-    .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 14px; padding: 18px; min-width: 0; max-width: 100%; }
     .section-title { font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0 0 12px; }
     label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 6px; text-align: left; }
     input, select, button.btn-primary {
@@ -136,8 +137,8 @@
     }
     .preview-box {
       margin-top: 8px; background: #070b14; border: 1px solid var(--border); border-radius: 10px;
-      height: 440px; overflow-y: auto; padding: 14px;
-      display: flex; flex-direction: column; align-items: center; gap: 14px;
+      height: 440px; overflow-y: auto; overflow-x: hidden; padding: 14px;
+      display: flex; flex-direction: column; align-items: center; gap: 14px; width: 100%;
     }
     .preview-empty { color: var(--muted); font-size: 13px; text-align: center; margin: auto; padding: 24px; }
     .sheet-frame {
@@ -435,6 +436,7 @@
     let statusTimer = null;
     let wfStepIndex = 0;
     let renderToken = 0;
+    let resizeTimer = null;
 
     setInterval(() => {
       wfStepIndex = (wfStepIndex + 1) % 4;
@@ -445,6 +447,12 @@
       const bar = document.getElementById('wfProgressBar');
       if (bar) bar.style.width = `${(wfStepIndex + 1) * 25}%`;
     }, 2200);
+
+    window.addEventListener('resize', () => {
+      if (totalLoadedPages <= 0) return;
+      clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(() => renderPreview(), 150);
+    });
 
     async function initApp() {
       const errEl = document.getElementById('loginErr');
@@ -564,7 +572,7 @@
         : '<tr><th>Document</th><th>Mode</th><th>Pages</th><th>Cost</th><th>Status</th><th>Time</th></tr>';
 
       refreshStatus();
-      if (!statusTimer) statusTimer = setInterval(refreshStatus, 4000);
+      if (!statusTimer) statusTimer = setInterval(refreshStatus, 2500);
     }
 
     function onSignedOut() {
@@ -644,11 +652,14 @@
     function getSheetDims(paper, orientation) {
       const ratios = { A4: 210 / 297, A5: 148 / 210, Letter: 215.9 / 279.4 };
       const r = ratios[paper] || ratios.A4;
+      const box = document.getElementById('previewBox');
+      const boxW = Math.max(200, (box ? box.clientWidth : 340) - 34);
+      const maxW = Math.min(360, boxW);
       if (orientation === 'landscape') {
-        const w = 360;
+        const w = maxW;
         return { w, h: Math.round(w * r) };
       }
-      const h = 340;
+      const h = Math.min(340, Math.round(maxW / r));
       return { w: Math.round(h * r), h };
     }
 
@@ -692,7 +703,7 @@
 
       if (!file) {
         meta.textContent = 'Supports PDF, PNG, JPG (max 25 MB)';
-        box.innerHTML = '<div class="preview-empty">Select or drop a PDF or photo above to preview it here.</div>';
+        box.innerHTML = '<div class="preview-empty">Select or drop a Document above to preview here.</div>';
         updateEstimate(0);
         return;
       }
@@ -856,6 +867,13 @@
             const isColor = j.colorMode !== 'B&W';
             const timeStr = j.createdAt ? new Date(j.createdAt).toLocaleString() : '—';
             const costStr = `${j.costBdt || ((j.totalPages || 1) * (isColor ? 4 : 3))} BDT`;
+            const statusText = j.status === 'printing' ? `printing (${j.progress || 0}%)` : j.status;
+            const waitNote = (j.status === 'queued' && j.waitingPages > 0)
+              ? `<div style="font-size:11px;color:#fbbf24;margin-top:3px;">Your job is waiting for ${j.waitingPages} page(s)</div>`
+              : '';
+            const cancelBtn = (j.status === 'queued' || j.status === 'printing')
+              ? ` <button class="btn-ghost" style="padding:2px 7px;font-size:11px;margin-left:4px;" onclick="cancelJob('${j.id}')">Cancel</button>`
+              : '';
             if (isAdmin) {
               return `<tr>
                 <td>${j.name}</td>
@@ -864,7 +882,7 @@
                 <td><span class="pill ${isColor ? 'pill-color' : 'pill-bw'}">${j.colorMode || 'Color'}</span></td>
                 <td>${j.totalPages || 1}</td>
                 <td style="color:#fbbf24;font-weight:600;">${costStr}</td>
-                <td><span class="pill pill-status">${j.status}</span>${(j.status === 'queued' || j.status === 'printing') ? ` <button class="btn-ghost" style="padding:2px 7px;font-size:11px;margin-left:4px;" onclick="cancelJob('${j.id}')">Cancel</button>` : ''}</td>
+                <td><span class="pill pill-status">${statusText}</span>${cancelBtn}${waitNote}</td>
                 <td style="color:#94a3b8;font-size:12px;">${timeStr}</td>
               </tr>`;
             }
@@ -873,7 +891,7 @@
               <td><span class="pill ${isColor ? 'pill-color' : 'pill-bw'}">${j.colorMode || 'Color'}</span></td>
               <td>${j.totalPages || 1}</td>
               <td style="color:#fbbf24;font-weight:600;">${costStr}</td>
-              <td><span class="pill pill-status">${j.status}</span>${(j.status === 'queued' || j.status === 'printing') ? ` <button class="btn-ghost" style="padding:2px 7px;font-size:11px;margin-left:4px;" onclick="cancelJob('${j.id}')">Cancel</button>` : ''}</td>
+              <td><span class="pill pill-status">${statusText}</span>${cancelBtn}${waitNote}</td>
               <td style="color:#94a3b8;font-size:12px;">${timeStr}</td>
             </tr>`;
           }).join('');

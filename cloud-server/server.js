@@ -615,7 +615,16 @@ app.get('/api/esp/poll', requireDeviceToken, (req, res) => {
   if (typeof req.query.ssid === 'string') {
     espWifiSsid = req.query.ssid.slice(0, 64);
   }
-  if (req.query.hb === '1') return res.status(204).end();
+  if (req.query.hb === '1') {
+    if (req.query.jobId && req.query.pct !== undefined) {
+      const activeJob = jobs.find(j => j.id === req.query.jobId && j.status === 'printing');
+      if (activeJob) {
+        activeJob.progress = Math.min(99, Math.max(0, parseInt(req.query.pct, 10) || 0));
+        activeJob.printingAt = Date.now();
+      }
+    }
+    return res.status(204).end();
+  }
   recoverStuckJobs();
   const nextJob = jobs.find(j => j.status === 'queued');
   if (!nextJob) return res.status(204).end();
@@ -641,6 +650,7 @@ app.post('/api/esp/job/:id/done', requireDeviceToken, express.json(), async (req
   if (!job) return res.status(404).json({ error: 'Job not found' });
   const ok = !req.body || req.body.ok !== false;
   job.status = ok ? 'completed' : 'failed';
+  job.progress = ok ? 100 : (job.progress || 0);
   if (fs.existsSync(job.filePath)) fs.unlink(job.filePath, () => {});
   await updateJobStatusInFirestore(job, ok);
   res.json({ ok: true });
@@ -650,6 +660,26 @@ function resolveUserDueBdt(u) {
   if (typeof u.dueAmountBdt === 'number') return u.dueAmountBdt;
   if (u.dueResetFlag) return computeDueBdt(u.dueColorPages || 0, u.dueBwPages || 0);
   return computeDueBdt(u.colorPages || 0, u.bwPages || 0);
+}
+
+function getJobQueueMeta(jobId, status) {
+  const idx = jobs.findIndex(j => j.id === jobId);
+  if (idx === -1) {
+    return { progress: status === 'completed' ? 100 : 0, waitingPages: 0 };
+  }
+  const mem = jobs[idx];
+  let waitingPages = 0;
+  if (mem.status === 'queued') {
+    for (let i = 0; i < idx; i++) {
+      if (jobs[i].status === 'printing' || jobs[i].status === 'queued') {
+        waitingPages += Number(jobs[i].totalPages || 1);
+      }
+    }
+  }
+  return {
+    progress: mem.status === 'completed' ? 100 : (mem.progress || 0),
+    waitingPages
+  };
 }
 
 app.get('/api/status', requireGoogleUser, async (req, res) => {
@@ -696,6 +726,7 @@ app.get('/api/status', requireGoogleUser, async (req, res) => {
               ? d.costBdt
               : computeDueBdt(d.colorMode === 'Color' ? (d.totalPages || 1) : 0, d.colorMode === 'B&W' ? (d.totalPages || 1) : 0),
             status: st,
+            ...getJobQueueMeta(d.jobId || doc.id, st),
             createdAt: d.createdAt
           };
         });
@@ -746,6 +777,7 @@ app.get('/api/status', requireGoogleUser, async (req, res) => {
                 ? d.costBdt
                 : computeDueBdt(d.colorMode === 'Color' ? (d.totalPages || 1) : 0, d.colorMode === 'B&W' ? (d.totalPages || 1) : 0),
               status: d.status,
+              ...getJobQueueMeta(d.jobId || doc.id, d.status),
               createdAt: d.createdAt
             };
           })
@@ -757,7 +789,7 @@ app.get('/api/status', requireGoogleUser, async (req, res) => {
     }
   } else {
     const visible = isAdmin ? jobs : jobs.filter(j => j.uid === req.user.uid);
-    recentJobs = visible.slice(-20).reverse();
+    recentJobs = visible.slice(-20).reverse().map(j => ({ ...j, ...getJobQueueMeta(j.id, j.status) }));
     for (const j of visible) {
       if (j.status === 'completed') {
         summary.totalJobs += 1;
