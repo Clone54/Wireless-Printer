@@ -59,6 +59,7 @@ const jobs = [];
 const memoryUserDues = {};
 let lastEspSeen = 0;
 let espPrinterStatus = 'Unknown';
+let espWifiSsid = '';
 
 function computeDueBdt(colorPages, bwPages) {
   return (Number(colorPages || 0) * RATE_COLOR_BDT) + (Number(bwPages || 0) * RATE_BW_BDT);
@@ -611,6 +612,10 @@ app.get('/api/esp/poll', requireDeviceToken, (req, res) => {
   if (req.query.status) {
     espPrinterStatus = String(req.query.status).slice(0, 40);
   }
+  if (typeof req.query.ssid === 'string') {
+    espWifiSsid = req.query.ssid.slice(0, 64);
+  }
+  if (req.query.hb === '1') return res.status(204).end();
   recoverStuckJobs();
   const nextJob = jobs.find(j => j.status === 'queued');
   if (!nextJob) return res.status(204).end();
@@ -768,6 +773,7 @@ app.get('/api/status', requireGoogleUser, async (req, res) => {
   res.json({
     espOnline,
     espPrinterStatus: espOnline ? espPrinterStatus : 'Offline',
+    espWifiSsid: (isAdmin && espOnline) ? espWifiSsid : undefined,
     user: req.user,
     rates: { colorBdt: RATE_COLOR_BDT, bwBdt: RATE_BW_BDT },
     summary,

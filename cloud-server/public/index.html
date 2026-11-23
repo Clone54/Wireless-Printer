@@ -194,8 +194,8 @@
 
   <!-- Google Sign-In Screen -->
   <div id="loginScreen" class="login-wrap">
-    <h1>Epson L3210 Cloud Print</h1>
-    <p id="loginHint">Print PDFs &amp; photos wirelessly from any network in 4 simple steps.</p>
+    <h1>Firoz Cloud Print</h1>
+    <p id="loginHint">Print Documents wirelessly from any network in 4 simple steps.</p>
     <div class="rate-banner">
       <span>Color: <b>4 BDT / page</b></span>
       <span>•</span>
@@ -214,19 +214,19 @@
           <div class="wf-icon">&#128196;</div>
           <div class="wf-num">Step 2</div>
           <div class="wf-title">Upload &amp; Preview</div>
-          <div class="wf-desc">Select your PDF or photo with live preview</div>
+          <div class="wf-desc">Select your Document</div>
         </div>
         <div class="wf-step" id="wfStep2">
           <div class="wf-icon">&#9881;&#65039;</div>
           <div class="wf-num">Step 3</div>
           <div class="wf-title">Print Setup</div>
-          <div class="wf-desc">A4/A5/Letter, Portrait or Landscape, N-up</div>
+          <div class="wf-desc">Modify your setup</div>
         </div>
         <div class="wf-step" id="wfStep3">
           <div class="wf-icon">&#128424;&#65039;</div>
           <div class="wf-num">Step 4</div>
           <div class="wf-title">Printed!</div>
-          <div class="wf-desc">ESP32-S3 streams directly to Epson L3210</div>
+          <div class="wf-desc">Document directly sent to Epson L3210</div>
         </div>
       </div>
       <div class="wf-progress"><div class="wf-progress-bar" id="wfProgressBar"></div></div>
@@ -247,7 +247,7 @@
   <div id="dashboard" class="container hidden">
     <div class="header">
       <div>
-        <h1>Epson L3210 Cloud Print</h1>
+        <h1>Firoz Cloud Print</h1>
         <p class="sub" id="userSub">Signed in</p>
       </div>
       <div class="header-right">
@@ -286,7 +286,7 @@
       <div class="card">
         <div class="section-title">1. Document &amp; Live Sheet Preview</div>
         <div class="dropzone" id="dropzone" onclick="document.getElementById('file').click()">
-          <div style="font-weight: 600; font-size: 14px;">Tap or drag &amp; drop a PDF or Photo</div>
+          <div style="font-weight: 600; font-size: 14px;">Tap or drag &amp; drop a Document</div>
           <div class="file-meta" id="fileMeta">Supports PDF, PNG, JPG (max 25 MB)</div>
           <input id="file" type="file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/*" onchange="handleFileSelect()" />
         </div>
@@ -296,7 +296,7 @@
           <span id="previewLayoutBadge">A4 • Portrait</span>
         </div>
         <div class="preview-box" id="previewBox">
-          <div class="preview-empty">Select or drop a PDF or photo above to preview exact pages, orientation, and pages-per-sheet here.</div>
+          <div class="preview-empty">Select or drop a Document above to preview here.</div>
         </div>
       </div>
 
@@ -327,7 +327,7 @@
             <label for="color">Color Mode</label>
             <select id="color" onchange="renderPreview()">
               <option value="RGB">Color (4 BDT/p)</option>
-              <option value="Gray">B&amp;W (3 BDT/p)</option>
+              <option value="Gray">Black&amp;White (3 BDT/p)</option>
             </select>
           </div>
           <div>
@@ -360,15 +360,15 @@
         <!-- More Settings Tab -->
         <details class="more-settings">
           <summary>
-            <span>More Settings (Page order &amp; N-up)</span>
+            <span>More Settings</span>
             <span style="font-size:11px;color:#94a3b8;" id="moreSummary">Last to First • 1/sheet</span>
           </summary>
           <label for="pageOrder">Print Order</label>
           <select id="pageOrder" onchange="renderPreview()">
-            <option value="reverse" selected>Last to First (Default)</option>
-            <option value="normal">First to Last (1, 2, 3...)</option>
+            <option value="reverse" selected>Last to First</option>
+            <option value="normal">First to Last</option>
           </select>
-          <label for="pagesPerSheet">Pages per Sheet (N-up)</label>
+          <label for="pagesPerSheet">Pages per Sheet</label>
           <select id="pagesPerSheet" onchange="renderPreview()">
             <option value="1">1 page per sheet (Normal)</option>
             <option value="2">2 pages per sheet</option>
@@ -816,7 +816,8 @@
         const data = await res.json();
 
         const badge = document.getElementById('espBadge');
-        badge.textContent = data.espOnline ? `Online (${data.espPrinterStatus})` : 'Offline';
+        const wifiTag = (isAdmin && data.espOnline && data.espWifiSsid) ? ` • WiFi: ${data.espWifiSsid}` : '';
+        badge.textContent = data.espOnline ? `Online (${data.espPrinterStatus})${wifiTag}` : 'Offline';
         badge.className = 'badge ' + (data.espOnline ? 'ok' : 'off');
 
         if (data.summary) {
