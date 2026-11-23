@@ -282,15 +282,23 @@ function runFilter(cmd, args, stdinBuf, envExtra = {}) {
   });
 }
 
-async function countSelectedPages(filePath, ext, pageMode, customPages) {
-  if (ext !== '.pdf') return 1;
+async function getSelectedPageList(filePath, ext, pageMode, customPages) {
+  if (ext !== '.pdf') return [1];
 
   const info = await runFilter('pdfinfo', [filePath], null);
   const match = info.stdout.toString('utf8').match(/Pages:\s+(\d+)/i);
   const totalPdfPages = match ? Math.max(1, parseInt(match[1], 10)) : 1;
 
-  if (pageMode === 'odd') return Math.ceil(totalPdfPages / 2);
-  if (pageMode === 'even') return Math.max(0, Math.floor(totalPdfPages / 2));
+  if (pageMode === 'odd') {
+    const arr = [];
+    for (let p = 1; p <= totalPdfPages; p += 2) arr.push(p);
+    return arr;
+  }
+  if (pageMode === 'even') {
+    const arr = [];
+    for (let p = 2; p <= totalPdfPages; p += 2) arr.push(p);
+    return arr;
+  }
   if (pageMode === 'custom' && customPages) {
     const selected = new Set();
     for (const part of customPages.split(',')) {
@@ -303,9 +311,63 @@ async function countSelectedPages(filePath, ext, pageMode, customPages) {
         for (let p = start; p <= end; p++) selected.add(p);
       }
     }
-    return selected.size > 0 ? selected.size : totalPdfPages;
+    return selected.size > 0 ? Array.from(selected).sort((a, b) => a - b) : Array.from({ length: totalPdfPages }, (_, i) => i + 1);
   }
-  return totalPdfPages;
+  return Array.from({ length: totalPdfPages }, (_, i) => i + 1);
+}
+
+async function countSelectedPages(filePath, ext, pageMode, customPages) {
+  const list = await getSelectedPageList(filePath, ext, pageMode, customPages);
+  return list.length;
+}
+
+const PSRAM_CHUNK_THRESHOLD = 6500000; // 6.5 MB threshold (fits safely inside 7 MB ESP32-S3 PSRAM buffer)
+
+async function renderEscprBuffer({ inputPath, ext, originalName, paper, cupsOpts, copies, optsStr, envVars }) {
+  const a1 = await runFilter('cupsfilter', [
+    '-e', '-p', PPD_PATH, '-d', 'epson_l3210', '-m', 'printer/foo',
+    ...cupsOpts, '-o', `copies=${copies}`, inputPath
+  ], null, envVars);
+
+  let finalBuf = a1.stdout;
+  let diagLog = `A1(cupsfilter -e): ${describeHeader(a1.stdout)} err=[${a1.stderr.trim()}]`;
+
+  if (!isValidEscpr(finalBuf)) {
+    const a2Ras = await runFilter('cupsfilter', [
+      '-p', PPD_PATH, '-m', 'application/vnd.cups-raster', ...cupsOpts, inputPath
+    ], null, envVars);
+
+    diagLog += ` | A2-Raster: ${describeHeader(a2Ras.stdout)}`;
+    let rasterBuf = a2Ras.stdout;
+
+    if (!rasterBuf || rasterBuf.length < 64) {
+      let pdfPath = inputPath;
+      if (ext !== '.pdf') {
+        pdfPath = `${inputPath}.pdf`;
+        await runFilter('convert', [inputPath, '-page', paper, pdfPath], null);
+      }
+      const gsRas = await runFilter('gs', [
+        '-q', '-dNOPAUSE', '-dBATCH', '-dSAFER',
+        '-sDEVICE=cups', '-r360x360', `-sPAPERSIZE=${paper.toLowerCase()}`,
+        '-dcupsColorSpace=1', '-dcupsBitsPerColor=8', '-dcupsColorOrder=0',
+        '-sOutputFile=-', pdfPath
+      ], null, envVars);
+      if (pdfPath !== inputPath) fs.unlink(pdfPath, () => {});
+      rasterBuf = gsRas.stdout;
+      diagLog += ` | A3-GS-Raster: ${describeHeader(rasterBuf)} err=[${gsRas.stderr.trim()}]`;
+    }
+
+    if (rasterBuf && rasterBuf.length >= 64) {
+      const wrapRes = await runFilter(
+        '/usr/lib/cups/filter/epson-escpr-wrapper',
+        ['1', 'root', originalName, String(copies), optsStr],
+        rasterBuf, envVars
+      );
+      finalBuf = wrapRes.stdout;
+      diagLog += ` | Wrapper: ${describeHeader(finalBuf)} err=[${wrapRes.stderr.trim()}]`;
+    }
+  }
+  return { finalBuf, diagLog };
 }
 
 async function upsertUserOnLogin(user, devInfo) {
@@ -544,7 +606,8 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
     ? req.body.quality
     : 'PLAIN_NORMAL';
 
-  const selectedPages = await countSelectedPages(inputPath, ext, pageMode, customPages);
+  const selectedPageList = await getSelectedPageList(inputPath, ext, pageMode, customPages);
+  const selectedPages = selectedPageList.length;
   if (selectedPages === 0) {
     cleanup();
     return res.status(400).json({ error: 'No pages matched your selected page filter.' });
@@ -554,17 +617,18 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
   const costBdt = colorMode === 'Color' ? (totalPages * RATE_COLOR_BDT) : (totalPages * RATE_BW_BDT);
   const devInfo = parseDeviceInfo(req);
 
-  const cupsOpts = [
+  const baseCupsOpts = [
     '-o', `PageSize=${paper}`,
     '-o', `media=${paper}`,
     '-o', `Ink=${ink}`,
     '-o', `MediaType=${quality}`,
     '-o', 'fit-to-page'
   ];
+  if (orientation === 'landscape') baseCupsOpts.push('-o', 'landscape');
+  if (pageOrder === 'reverse') baseCupsOpts.push('-o', 'outputorder=reverse');
+  if (pagesPerSheet > 1) baseCupsOpts.push('-o', `number-up=${pagesPerSheet}`);
 
-  if (orientation === 'landscape') cupsOpts.push('-o', 'landscape');
-  if (pageOrder === 'reverse') cupsOpts.push('-o', 'outputorder=reverse');
-  if (pagesPerSheet > 1) cupsOpts.push('-o', `number-up=${pagesPerSheet}`);
+  const cupsOpts = [...baseCupsOpts];
   if (pageMode === 'odd') cupsOpts.push('-o', 'page-set=odd');
   else if (pageMode === 'even') cupsOpts.push('-o', 'page-set=even');
   else if (pageMode === 'custom' && customPages) cupsOpts.push('-o', `page-ranges=${customPages}`);
@@ -573,58 +637,88 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
   const envVars = { PPD: PPD_PATH, PRINTER: 'epson_l3210', CUPS_SERVERROOT: '/etc/cups' };
 
   try {
-    const a1 = await runFilter('cupsfilter', [
-      '-e', '-p', PPD_PATH, '-d', 'epson_l3210', '-m', 'printer/foo',
-      ...cupsOpts, '-o', `copies=${copies}`, inputPath
-    ], null, envVars);
+    const { finalBuf, diagLog } = await renderEscprBuffer({
+      inputPath, ext, originalName, paper, cupsOpts, copies, optsStr, envVars
+    });
 
-    let finalBuf = a1.stdout;
-    let diagLog = `A1(cupsfilter -e): ${describeHeader(a1.stdout)} err=[${a1.stderr.trim()}]`;
-
-    if (!isValidEscpr(finalBuf)) {
-      const a2Ras = await runFilter('cupsfilter', [
-        '-p', PPD_PATH, '-m', 'application/vnd.cups-raster', ...cupsOpts, inputPath
-      ], null, envVars);
-
-      diagLog += ` | A2-Raster: ${describeHeader(a2Ras.stdout)}`;
-      let rasterBuf = a2Ras.stdout;
-
-      if (!rasterBuf || rasterBuf.length < 64) {
-        let pdfPath = inputPath;
-        if (ext !== '.pdf') {
-          pdfPath = `${inputPath}.pdf`;
-          await runFilter('convert', [inputPath, '-page', paper, pdfPath], null);
-        }
-        const gsRas = await runFilter('gs', [
-          '-q', '-dNOPAUSE', '-dBATCH', '-dSAFER',
-          '-sDEVICE=cups', '-r360x360', `-sPAPERSIZE=${paper.toLowerCase()}`,
-          '-dcupsColorSpace=1', '-dcupsBitsPerColor=8', '-dcupsColorOrder=0',
-          '-sOutputFile=-', pdfPath
-        ], null, envVars);
-        if (pdfPath !== inputPath) fs.unlink(pdfPath, () => {});
-        rasterBuf = gsRas.stdout;
-        diagLog += ` | A3-GS-Raster: ${describeHeader(rasterBuf)} err=[${gsRas.stderr.trim()}]`;
-      }
-
-      if (rasterBuf && rasterBuf.length >= 64) {
-        const wrapRes = await runFilter(
-          '/usr/lib/cups/filter/epson-escpr-wrapper',
-          ['1', 'root', originalName, String(copies), optsStr],
-          rasterBuf, envVars
-        );
-        finalBuf = wrapRes.stdout;
-        diagLog += ` | Wrapper: ${describeHeader(finalBuf)} err=[${wrapRes.stderr.trim()}]`;
-      }
-    }
-
-    cleanup();
     console.log('[CUPS Pipeline]', diagLog);
 
     if (!isValidEscpr(finalBuf)) {
+      cleanup();
       return res.status(500).json({ error: `Safety block (no paper wasted). Diagnostics: ${diagLog}` });
     }
 
-    fs.writeFileSync(outPath, finalBuf);
+    let chunks = [];
+    let totalSize = finalBuf.length;
+
+    // Automatic Threshold-Based Page Chunking:
+    // If <= 6.5 MB, keep as 1 single continuous file (zero extra pauses).
+    // If > 6.5 MB on a multi-sheet PDF, split into ~3.5 MB sub-chunks so every chunk fits 100% in ESP32-S3 PSRAM!
+    if (ext === '.pdf' && finalBuf.length > PSRAM_CHUNK_THRESHOLD && sheetsPerCopy > 1) {
+      const avgSheetBytes = Math.ceil(finalBuf.length / totalPages);
+      const maxSheetsPerChunk = Math.max(1, Math.floor(3800000 / Math.max(1, avgSheetBytes)));
+      const pagesPerChunk = maxSheetsPerChunk * pagesPerSheet;
+
+      const sheetGroups = [];
+      for (let i = 0; i < selectedPageList.length; i += pagesPerSheet) {
+        sheetGroups.push(selectedPageList.slice(i, i + pagesPerSheet));
+      }
+      if (pageOrder === 'reverse') {
+        sheetGroups.reverse();
+      }
+      const sheetsPerGroup = Math.max(1, Math.floor(pagesPerChunk / pagesPerSheet));
+      const chunkPageBatches = [];
+      for (let i = 0; i < sheetGroups.length; i += sheetsPerGroup) {
+        const groupSlice = sheetGroups.slice(i, i + sheetsPerGroup);
+        if (pageOrder === 'reverse') groupSlice.reverse();
+        const flatPages = [];
+        for (const g of groupSlice) {
+          for (const p of g) flatPages.push(p);
+        }
+        flatPages.sort((a, b) => a - b);
+        chunkPageBatches.push(flatPages);
+      }
+
+      totalSize = 0;
+      let chunkSuccess = true;
+      for (let c = 0; c < copies && chunkSuccess; c++) {
+        for (let bIdx = 0; bIdx < chunkPageBatches.length; bIdx++) {
+          const batchPages = chunkPageBatches[bIdx];
+          const rangeSpec = batchPages.join(',');
+          const chunkOpts = [...baseCupsOpts, '-o', `page-ranges=${rangeSpec}`];
+          const cRes = await renderEscprBuffer({
+            inputPath, ext, originalName, paper, cupsOpts: chunkOpts, copies: 1, optsStr, envVars
+          });
+          if (!isValidEscpr(cRes.finalBuf)) {
+            chunkSuccess = false;
+            break;
+          }
+          const cIdx = chunks.length;
+          const cPath = path.join(JOBS_DIR, `${jobId}_c${cIdx}.prn`);
+          fs.writeFileSync(cPath, cRes.finalBuf);
+          chunks.push({ index: cIdx, filePath: cPath, size: cRes.finalBuf.length });
+          totalSize += cRes.finalBuf.length;
+        }
+      }
+
+      if (!chunkSuccess || chunks.length === 0) {
+        for (const ch of chunks) {
+          if (fs.existsSync(ch.filePath)) fs.unlink(ch.filePath, () => {});
+        }
+        chunks = [];
+        fs.writeFileSync(outPath, finalBuf);
+        chunks.push({ index: 0, filePath: outPath, size: finalBuf.length });
+        totalSize = finalBuf.length;
+      } else {
+        console.log(`[Chunker] Split large job ${jobId} (${(finalBuf.length / 1048576).toFixed(2)} MB) into ${chunks.length} PSRAM-safe chunks`);
+      }
+    } else {
+      fs.writeFileSync(outPath, finalBuf);
+      chunks.push({ index: 0, filePath: outPath, size: finalBuf.length });
+    }
+
+    cleanup();
+
     const job = {
       id: jobId,
       uid: req.user.uid,
@@ -645,14 +739,16 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
       quality,
       pageMode,
       customPages,
-      size: finalBuf.length,
+      size: totalSize,
+      chunks,
+      currentChunk: 0,
       status: 'queued',
       createdAt: new Date().toISOString(),
-      filePath: outPath
+      filePath: chunks[0].filePath
     };
     jobs.push(job);
     await saveJobToFirestore(job);
-    console.log(`[Queue] Job ${jobId} by ${req.user.email} (${totalPages}p ${colorMode}, ${costBdt} BDT)`);
+    console.log(`[Queue] Job ${jobId} by ${req.user.email} (${totalPages}p ${colorMode}, ${costBdt} BDT, ${chunks.length} chunk(s))`);
     return res.json({ ok: true, job: { id: job.id, name: job.name, size: job.size, totalPages, colorMode, costBdt, status: job.status } });
   } catch (e) {
     cleanup();
@@ -694,6 +790,8 @@ app.post('/api/print-raw', requireDeviceToken, express.raw({ type: '*/*', limit:
     pageMode: 'all',
     customPages: '',
     size: req.body.length,
+    chunks: [{ index: 0, filePath: outPath, size: req.body.length }],
+    currentChunk: 0,
     status: 'queued',
     createdAt: new Date().toISOString(),
     filePath: outPath
@@ -703,18 +801,34 @@ app.post('/api/print-raw', requireDeviceToken, express.raw({ type: '*/*', limit:
   res.json({ ok: true, jobId, size: job.size });
 });
 
+function cleanupJobFiles(job) {
+  if (Array.isArray(job.chunks)) {
+    for (const ch of job.chunks) {
+      if (ch.filePath && fs.existsSync(ch.filePath)) fs.unlink(ch.filePath, () => {});
+    }
+  }
+  if (job.filePath && fs.existsSync(job.filePath)) fs.unlink(job.filePath, () => {});
+}
+
+function parseEspJobToken(rawId) {
+  const m = String(rawId || '').match(/^([a-f0-9]+?)(?:_c(\d+))?$/i);
+  if (!m) return { baseId: String(rawId || ''), chunkIdx: null };
+  return { baseId: m[1], chunkIdx: m[2] !== undefined ? parseInt(m[2], 10) : null };
+}
+
 // Auto-recover jobs stuck in 'printing' > 2 minutes without stream activity
 function recoverStuckJobs() {
   const now = Date.now();
   for (const j of jobs) {
     if (j.status === 'printing' && j.printingAt && (now - j.printingAt > 120000)) {
       j.retries = (j.retries || 0) + 1;
-      if (j.retries <= 2 && fs.existsSync(j.filePath)) {
+      const curChunk = (Array.isArray(j.chunks) && j.chunks[j.currentChunk || 0]) || { filePath: j.filePath };
+      if (j.retries <= 2 && curChunk.filePath && fs.existsSync(curChunk.filePath)) {
         j.status = 'queued';
-        console.log(`[Queue] Re-queued stalled job ${j.id} (retry ${j.retries})`);
+        console.log(`[Queue] Re-queued stalled job ${j.id} chunk ${j.currentChunk || 0} (retry ${j.retries})`);
       } else {
         j.status = 'failed';
-        if (fs.existsSync(j.filePath)) fs.unlink(j.filePath, () => {});
+        cleanupJobFiles(j);
         updateJobStatusInFirestore(j, false);
         console.log(`[Queue] Marked stalled job ${j.id} as failed`);
       }
@@ -730,7 +844,7 @@ app.post('/api/jobs/:id/cancel', requireGoogleUser, async (req, res) => {
       return res.status(403).json({ error: 'Not allowed' });
     }
     memJob.status = 'cancelled';
-    if (fs.existsSync(memJob.filePath)) fs.unlink(memJob.filePath, () => {});
+    cleanupJobFiles(memJob);
   }
   const cachedJob = dbCache.jobs.find(j => j.id === jobId);
   if (cachedJob) {
@@ -755,9 +869,14 @@ app.get('/api/esp/poll', requireDeviceToken, (req, res) => {
   }
   if (req.query.hb === '1') {
     if (req.query.jobId && req.query.pct !== undefined) {
-      const activeJob = jobs.find(j => j.id === req.query.jobId && j.status === 'printing');
+      const { baseId, chunkIdx } = parseEspJobToken(req.query.jobId);
+      const activeJob = jobs.find(j => j.id === baseId && j.status === 'printing');
       if (activeJob) {
-        activeJob.progress = Math.min(99, Math.max(0, parseInt(req.query.pct, 10) || 0));
+        const totalChunks = Array.isArray(activeJob.chunks) && activeJob.chunks.length > 0 ? activeJob.chunks.length : 1;
+        const cIdx = chunkIdx !== null ? chunkIdx : (activeJob.currentChunk || 0);
+        const rawPct = Math.min(99, Math.max(0, parseInt(req.query.pct, 10) || 0));
+        const overallPct = Math.min(99, Math.round(((cIdx * 100) + rawPct) / totalChunks));
+        activeJob.progress = overallPct;
         activeJob.printingAt = Date.now();
       }
     }
@@ -766,35 +885,66 @@ app.get('/api/esp/poll', requireDeviceToken, (req, res) => {
   recoverStuckJobs();
   const nextJob = jobs.find(j => j.status === 'queued');
   if (!nextJob) return res.status(204).end();
+
+  const totalChunks = Array.isArray(nextJob.chunks) && nextJob.chunks.length > 0 ? nextJob.chunks.length : 1;
+  const cIdx = nextJob.currentChunk || 0;
+  const curChunk = (Array.isArray(nextJob.chunks) && nextJob.chunks[cIdx]) || { filePath: nextJob.filePath, size: nextJob.size };
+
   nextJob.status = 'printing';
-  nextJob.progress = 0;
+  if (cIdx === 0) nextJob.progress = 0;
   nextJob.printingAt = Date.now();
   cacheUpsertJob({ id: nextJob.id, status: 'printing' });
-  if (db) {
+  if (db && cIdx === 0) {
     db.collection('print_jobs').doc(nextJob.id).update({ status: 'printing' }).catch(() => {});
   }
-  res.json({ id: nextJob.id, size: nextJob.size, name: nextJob.name });
+
+  const espJobId = totalChunks > 1 ? `${nextJob.id}_c${cIdx}` : nextJob.id;
+  res.json({ id: espJobId, size: curChunk.size, name: nextJob.name });
 });
 
 app.get('/api/esp/job/:id', requireDeviceToken, (req, res) => {
   lastEspSeen = Date.now();
-  const job = jobs.find(j => j.id === req.params.id);
-  if (!job || !fs.existsSync(job.filePath)) return res.status(404).end();
+  const { baseId, chunkIdx } = parseEspJobToken(req.params.id);
+  const job = jobs.find(j => j.id === baseId);
+  if (!job) return res.status(404).end();
+  const cIdx = chunkIdx !== null ? chunkIdx : (job.currentChunk || 0);
+  const curChunk = (Array.isArray(job.chunks) && job.chunks[cIdx]) || { filePath: job.filePath, size: job.size };
+  if (!curChunk.filePath || !fs.existsSync(curChunk.filePath)) return res.status(404).end();
+
   res.setHeader('Content-Type', 'application/octet-stream');
-  res.setHeader('Content-Length', job.size);
-  const stream = fs.createReadStream(job.filePath);
+  res.setHeader('Content-Length', curChunk.size);
+  const stream = fs.createReadStream(curChunk.filePath);
   stream.on('data', () => { lastEspSeen = Date.now(); job.printingAt = Date.now(); });
   stream.pipe(res);
 });
 
 app.post('/api/esp/job/:id/done', requireDeviceToken, express.json(), async (req, res) => {
   lastEspSeen = Date.now();
-  const job = jobs.find(j => j.id === req.params.id);
+  const { baseId, chunkIdx } = parseEspJobToken(req.params.id);
+  const job = jobs.find(j => j.id === baseId);
   if (!job) return res.status(404).json({ error: 'Job not found' });
   const ok = !req.body || req.body.ok !== false;
+
+  const totalChunks = Array.isArray(job.chunks) && job.chunks.length > 0 ? job.chunks.length : 1;
+  const cIdx = chunkIdx !== null ? chunkIdx : (job.currentChunk || 0);
+  const curChunk = Array.isArray(job.chunks) && job.chunks[cIdx];
+  if (curChunk && curChunk.filePath && fs.existsSync(curChunk.filePath)) {
+    fs.unlink(curChunk.filePath, () => {});
+  }
+
+  if (ok && (cIdx + 1) < totalChunks) {
+    job.currentChunk = cIdx + 1;
+    job.status = 'queued';
+    job.retries = 0;
+    job.progress = Math.min(99, Math.round(((cIdx + 1) * 100) / totalChunks));
+    job.printingAt = Date.now();
+    console.log(`[Chunker] Job ${job.id} chunk ${cIdx + 1}/${totalChunks} done (${job.progress}%), queued next chunk`);
+    return res.json({ ok: true, nextChunk: job.currentChunk });
+  }
+
   job.status = ok ? 'completed' : 'failed';
   job.progress = ok ? 100 : (job.progress || 0);
-  if (fs.existsSync(job.filePath)) fs.unlink(job.filePath, () => {});
+  cleanupJobFiles(job);
   await updateJobStatusInFirestore(job, ok);
   res.json({ ok: true });
 });
@@ -805,23 +955,41 @@ function resolveUserDueBdt(u) {
   return computeDueBdt(u.colorPages || 0, u.bwPages || 0);
 }
 
+function getRemainingJobPages(j) {
+  const totalP = Math.max(1, Number(j.totalPages || 1));
+  const isActive = j.status === 'printing' || (j.status === 'queued' && (j.currentChunk || 0) > 0);
+  if (!isActive) return totalP;
+  const pct = Math.min(99, Math.max(0, Number(j.progress || 0)));
+  const donePages = Math.min(totalP - 1, Math.floor((pct * totalP) / 100));
+  return Math.max(1, totalP - donePages);
+}
+
 function getJobQueueMeta(jobId, status) {
   const idx = jobs.findIndex(j => j.id === jobId);
   if (idx === -1) {
     return { status, progress: status === 'completed' ? 100 : 0, waitingPages: 0 };
   }
   const mem = jobs[idx];
+  const isMidChunk = mem.status === 'queued' && (mem.currentChunk || 0) > 0;
+  const uiStatus = isMidChunk ? 'printing' : mem.status;
+  const totalP = Math.max(1, Number(mem.totalPages || 1));
+  const pct = uiStatus === 'completed' ? 100 : Math.min(99, Math.max(0, Number(mem.progress || 0)));
+  const currentPage = uiStatus === 'completed'
+    ? totalP
+    : Math.min(totalP, Math.floor((pct * totalP) / 100) + 1);
+
   let waitingPages = 0;
-  if (mem.status === 'queued') {
+  if (uiStatus === 'queued') {
     for (let i = 0; i < idx; i++) {
       if (jobs[i].status === 'printing' || jobs[i].status === 'queued') {
-        waitingPages += Number(jobs[i].totalPages || 1);
+        waitingPages += getRemainingJobPages(jobs[i]);
       }
     }
   }
   return {
-    status: mem.status,
-    progress: mem.status === 'completed' ? 100 : (mem.progress || 0),
+    status: uiStatus,
+    progress: pct,
+    currentPage,
     waitingPages
   };
 }

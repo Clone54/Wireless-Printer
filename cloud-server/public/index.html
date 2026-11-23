@@ -437,6 +437,7 @@
     let wfStepIndex = 0;
     let renderToken = 0;
     let resizeTimer = null;
+    const jobWaitHistory = {};
 
     setInterval(() => {
       wfStepIndex = (wfStepIndex + 1) % 4;
@@ -572,7 +573,7 @@
         : '<tr><th>Document</th><th>Mode</th><th>Pages</th><th>Cost</th><th>Status</th><th>Time</th></tr>';
 
       refreshStatus();
-      if (!statusTimer) statusTimer = setInterval(refreshStatus, 2500);
+      if (!statusTimer) statusTimer = setInterval(refreshStatus, 1500);
     }
 
     function onSignedOut() {
@@ -867,10 +868,25 @@
             const isColor = j.colorMode !== 'B&W';
             const timeStr = j.createdAt ? new Date(j.createdAt).toLocaleString() : '—';
             const costStr = `${j.costBdt || ((j.totalPages || 1) * (isColor ? 4 : 3))} BDT`;
-            const statusText = j.status === 'printing' ? `printing (${j.progress || 0}%)` : j.status;
-            const waitNote = (j.status === 'queued' && j.waitingPages > 0)
-              ? `<div style="font-size:11px;color:#fbbf24;margin-top:3px;">Your job is waiting for ${j.waitingPages} page(s)</div>`
-              : '';
+            if (j.status === 'queued' && j.waitingPages > 0) {
+              jobWaitHistory[j.id] = { hadWait: true, startedAt: 0 };
+            } else if (jobWaitHistory[j.id] && jobWaitHistory[j.id].hadWait && j.status === 'printing' && !jobWaitHistory[j.id].startedAt) {
+              jobWaitHistory[j.id].startedAt = Date.now();
+            }
+            const totalP = Math.max(1, Number(j.totalPages || 1));
+            const pct = Math.min(100, Math.max(0, Number(j.progress || 0)));
+            const curPage = j.currentPage || Math.min(totalP, Math.floor((pct * totalP) / 100) + 1);
+            const statusText = j.status === 'printing'
+              ? `printing (${pct}% • Page ${curPage}/${totalP})`
+              : j.status;
+            let waitNote = '';
+            if (j.status === 'queued' && j.waitingPages > 0) {
+              waitNote = `<div style="font-size:11px;color:#fbbf24;margin-top:3px;">Your job is waiting for ${j.waitingPages} page(s)</div>`;
+            } else if (j.status === 'queued' && jobWaitHistory[j.id] && jobWaitHistory[j.id].hadWait) {
+              waitNote = `<div style="font-size:11px;color:#4ade80;margin-top:3px;">Done, your job is starting...</div>`;
+            } else if (j.status === 'printing' && jobWaitHistory[j.id] && jobWaitHistory[j.id].hadWait) {
+              waitNote = `<div style="font-size:11px;color:#4ade80;margin-top:3px;">Done, your job started!</div>`;
+            }
             const cancelBtn = (j.status === 'queued' || j.status === 'printing')
               ? ` <button class="btn-ghost" style="padding:2px 7px;font-size:11px;margin-left:4px;" onclick="cancelJob('${j.id}')">Cancel</button>`
               : '';
