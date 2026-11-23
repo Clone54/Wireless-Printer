@@ -395,6 +395,7 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
     ? parseInt(req.body.pagesPerSheet, 10)
     : 1;
   const orientation = req.body.orientation === 'landscape' ? 'landscape' : 'portrait';
+  const pageOrder = req.body.pageOrder === 'normal' ? 'normal' : 'reverse';
   const pageMode = req.body.pageMode || 'all';
   const customPages = String(req.body.customPages || '').replace(/[^0-9,\-]/g, '');
   const quality = ['PLAIN_NORMAL', 'PLAIN_HIGH', 'PMPHOTO_NORMAL'].includes(req.body.quality)
@@ -420,6 +421,7 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
   ];
 
   if (orientation === 'landscape') cupsOpts.push('-o', 'landscape');
+  if (pageOrder === 'reverse') cupsOpts.push('-o', 'outputorder=reverse');
   if (pagesPerSheet > 1) cupsOpts.push('-o', `number-up=${pagesPerSheet}`);
   if (pageMode === 'odd') cupsOpts.push('-o', 'page-set=odd');
   else if (pageMode === 'even') cupsOpts.push('-o', 'page-set=even');

@@ -360,9 +360,14 @@
         <!-- More Settings Tab -->
         <details class="more-settings">
           <summary>
-            <span>More Settings (Pages per sheet)</span>
-            <span style="font-size:11px;color:#94a3b8;" id="moreSummary">1 per sheet</span>
+            <span>More Settings (Page order &amp; N-up)</span>
+            <span style="font-size:11px;color:#94a3b8;" id="moreSummary">Last to First • 1/sheet</span>
           </summary>
+          <label for="pageOrder">Print Order</label>
+          <select id="pageOrder" onchange="renderPreview()">
+            <option value="reverse" selected>Last to First (Default)</option>
+            <option value="normal">First to Last (1, 2, 3...)</option>
+          </select>
           <label for="pagesPerSheet">Pages per Sheet (N-up)</label>
           <select id="pagesPerSheet" onchange="renderPreview()">
             <option value="1">1 page per sheet (Normal)</option>
@@ -658,7 +663,8 @@
 
     function updateEstimate(selectedCount = null) {
       const nUp = parseInt(document.getElementById('pagesPerSheet').value, 10) || 1;
-      document.getElementById('moreSummary').textContent = `${nUp} per sheet`;
+      const orderLabel = document.getElementById('pageOrder').value === 'normal' ? 'First to Last' : 'Last to First';
+      document.getElementById('moreSummary').textContent = `${orderLabel} • ${nUp}/sheet`;
 
       const count = selectedCount !== null ? selectedCount : getSelectedPageNumbers(totalLoadedPages).length;
       if (count <= 0) {
@@ -740,7 +746,9 @@
         return;
       }
 
-      const totalSheets = Math.ceil(selectedPages.length / nUp);
+      const pageOrder = document.getElementById('pageOrder').value;
+      const orderedPages = pageOrder === 'reverse' ? [...selectedPages].reverse() : selectedPages;
+      const totalSheets = Math.ceil(orderedPages.length / nUp);
       document.getElementById('previewSummary').textContent =
         `Showing ${selectedPages.length} page(s) on ${totalSheets} sheet(s)`;
 
@@ -757,7 +765,7 @@
         sheet.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
         sheet.style.gridTemplateRows = `repeat(${rows}, 1fr)`;
 
-        const slice = selectedPages.slice(s * nUp, (s + 1) * nUp);
+        const slice = orderedPages.slice(s * nUp, (s + 1) * nUp);
         for (const pageNum of slice) {
           const cell = document.createElement('div');
           cell.className = 'sheet-cell';
@@ -899,6 +907,7 @@
       form.append('orientation', document.getElementById('orientation').value);
       form.append('pageMode', pageMode);
       form.append('customPages', customPages);
+      form.append('pageOrder', document.getElementById('pageOrder').value);
       form.append('pagesPerSheet', document.getElementById('pagesPerSheet').value);
       form.append('copies', document.getElementById('copies').value);
 
