@@ -562,10 +562,14 @@ app.get('/api/esp/job/:id', requireDeviceToken, (req, res) => {
   if (!job || !fs.existsSync(job.filePath)) return res.status(404).end();
   res.setHeader('Content-Type', 'application/octet-stream');
   res.setHeader('Content-Length', job.size);
-  fs.createReadStream(job.filePath).pipe(res);
+  lastEspSeen = Date.now();
+  const stream = fs.createReadStream(job.filePath);
+  stream.on('data', () => { lastEspSeen = Date.now(); });
+  stream.pipe(res);
 });
 
 app.post('/api/esp/job/:id/done', requireDeviceToken, express.json(), async (req, res) => {
+  lastEspSeen = Date.now();
   const job = jobs.find(j => j.id === req.params.id);
   if (!job) return res.status(404).json({ error: 'Job not found' });
   const ok = !req.body || req.body.ok !== false;
