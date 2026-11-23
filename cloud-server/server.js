@@ -57,6 +57,95 @@ const upload = multer({
 
 const jobs = [];
 const memoryUserDues = {};
+const dbCache = {
+  loaded: false,
+  lastAttemptMs: 0,
+  summary: { totalJobs: 0, totalPages: 0, colorPages: 0, bwPages: 0 },
+  users: {},
+  jobs: []
+};
+
+function cacheUpsertJob(jobObj) {
+  const idx = dbCache.jobs.findIndex(j => j.id === jobObj.id);
+  if (idx >= 0) {
+    dbCache.jobs[idx] = { ...dbCache.jobs[idx], ...jobObj };
+  } else {
+    dbCache.jobs.unshift(jobObj);
+    if (dbCache.jobs.length > 100) dbCache.jobs.length = 100;
+  }
+}
+
+async function ensureDbCacheLoaded() {
+  if (!db || dbCache.loaded) return;
+  if (Date.now() - dbCache.lastAttemptMs < 300000) return;
+  dbCache.lastAttemptMs = Date.now();
+  try {
+    const [sumDoc, jobsSnap, usersSnap] = await Promise.all([
+      db.collection('stats').doc('summary').get(),
+      db.collection('print_jobs').orderBy('timestamp', 'desc').limit(100).get(),
+      db.collection('users').get()
+    ]);
+
+    if (sumDoc.exists) {
+      const d = sumDoc.data();
+      dbCache.summary = {
+        totalJobs: d.totalJobs || 0,
+        totalPages: d.totalPages || 0,
+        colorPages: d.colorPages || 0,
+        bwPages: d.bwPages || 0
+      };
+    }
+
+    const loadedUsers = {};
+    usersSnap.docs.forEach(doc => {
+      const u = doc.data();
+      const uid = u.uid || doc.id;
+      loadedUsers[uid] = { ...u, uid };
+    });
+    dbCache.users = { ...loadedUsers, ...dbCache.users };
+
+    const activeIds = new Set(jobs.map(j => j.id));
+    const tenMinAgo = Date.now() - 10 * 60 * 1000;
+    const loadedJobs = jobsSnap.docs.map(doc => {
+      const d = doc.data();
+      const jid = d.jobId || doc.id;
+      let st = d.status;
+      if ((st === 'queued' || st === 'printing') && !activeIds.has(jid)) {
+        const ts = d.createdAt ? Date.parse(d.createdAt) : 0;
+        if (ts && ts < tenMinAgo) {
+          st = 'expired';
+          doc.ref.update({ status: 'expired' }).catch(() => {});
+        }
+      }
+      return {
+        id: jid,
+        uid: d.uid || '',
+        userEmail: d.userEmail || '',
+        userName: d.userName || '',
+        name: d.name,
+        source: d.source || 'web',
+        device: d.device || d.source,
+        colorMode: d.colorMode || 'Color',
+        totalPages: d.totalPages || 1,
+        costBdt: typeof d.costBdt === 'number'
+          ? d.costBdt
+          : computeDueBdt(d.colorMode === 'Color' ? (d.totalPages || 1) : 0, d.colorMode === 'B&W' ? (d.totalPages || 1) : 0),
+        status: st,
+        createdAt: d.createdAt || new Date().toISOString()
+      };
+    });
+
+    const existingMap = new Map(loadedJobs.map(j => [j.id, j]));
+    for (const j of dbCache.jobs) {
+      if (!existingMap.has(j.id)) loadedJobs.unshift(j);
+    }
+    dbCache.jobs = loadedJobs.slice(0, 100);
+    dbCache.loaded = true;
+    console.log('[Cache] Loaded from Firestore:', dbCache.jobs.length, 'jobs,', Object.keys(dbCache.users).length, 'users');
+  } catch (err) {
+    console.error('[Cache] Firestore load failed (using RAM fallback):', err.message);
+  }
+}
 let lastEspSeen = 0;
 let espPrinterStatus = 'Unknown';
 let espWifiSsid = '';
@@ -220,6 +309,16 @@ async function countSelectedPages(filePath, ext, pageMode, customPages) {
 }
 
 async function upsertUserOnLogin(user, devInfo) {
+  const prevU = dbCache.users[user.uid] || {};
+  dbCache.users[user.uid] = {
+    ...prevU,
+    uid: user.uid,
+    email: user.email,
+    name: user.name,
+    role: user.isAdmin ? 'admin' : 'user',
+    lastDevice: devInfo.device,
+    lastIp: devInfo.ip
+  };
   if (!db) return;
   try {
     await db.collection('users').doc(user.uid).set({
@@ -237,6 +336,20 @@ async function upsertUserOnLogin(user, devInfo) {
 }
 
 async function saveJobToFirestore(job) {
+  cacheUpsertJob({
+    id: job.id,
+    uid: job.uid,
+    userEmail: job.userEmail,
+    userName: job.userName,
+    name: job.name,
+    source: job.source,
+    device: job.device,
+    colorMode: job.colorMode,
+    totalPages: job.totalPages,
+    costBdt: job.costBdt,
+    status: job.status,
+    createdAt: job.createdAt
+  });
   if (!db) return;
   try {
     await db.collection('print_jobs').doc(job.id).set({
@@ -270,10 +383,32 @@ async function saveJobToFirestore(job) {
 }
 
 async function updateJobStatusInFirestore(job, ok) {
-  if (ok && job.uid) {
-    if (!memoryUserDues[job.uid]) memoryUserDues[job.uid] = { dueColorPages: 0, dueBwPages: 0 };
-    if (job.colorMode === 'Color') memoryUserDues[job.uid].dueColorPages += job.totalPages;
-    else memoryUserDues[job.uid].dueBwPages += job.totalPages;
+  cacheUpsertJob({ id: job.id, status: job.status });
+  if (ok) {
+    const colorInc = job.colorMode === 'Color' ? job.totalPages : 0;
+    const bwInc = job.colorMode === 'B&W' ? job.totalPages : 0;
+    const costInc = computeDueBdt(colorInc, bwInc);
+    dbCache.summary.totalJobs = (dbCache.summary.totalJobs || 0) + 1;
+    dbCache.summary.totalPages = (dbCache.summary.totalPages || 0) + job.totalPages;
+    dbCache.summary.colorPages = (dbCache.summary.colorPages || 0) + colorInc;
+    dbCache.summary.bwPages = (dbCache.summary.bwPages || 0) + bwInc;
+
+    if (job.uid) {
+      if (!memoryUserDues[job.uid]) memoryUserDues[job.uid] = { dueColorPages: 0, dueBwPages: 0 };
+      if (job.colorMode === 'Color') memoryUserDues[job.uid].dueColorPages += job.totalPages;
+      else memoryUserDues[job.uid].dueBwPages += job.totalPages;
+
+      const u = dbCache.users[job.uid] || { uid: job.uid, email: job.userEmail, name: job.userName };
+      u.totalJobs = (u.totalJobs || 0) + 1;
+      u.totalPages = (u.totalPages || 0) + job.totalPages;
+      u.colorPages = (u.colorPages || 0) + colorInc;
+      u.bwPages = (u.bwPages || 0) + bwInc;
+      u.dueColorPages = (u.dueColorPages || 0) + colorInc;
+      u.dueBwPages = (u.dueBwPages || 0) + bwInc;
+      u.dueAmountBdt = resolveUserDueBdt(u) + costInc;
+      u.dueResetFlag = true;
+      dbCache.users[job.uid] = u;
+    }
   }
 
   if (!db) return;
@@ -346,6 +481,12 @@ app.post('/api/admin/reset-due', requireGoogleUser, express.json(), async (req, 
   }
 
   memoryUserDues[targetUid] = { dueColorPages: 0, dueBwPages: 0 };
+  if (dbCache.users[targetUid]) {
+    dbCache.users[targetUid].dueColorPages = 0;
+    dbCache.users[targetUid].dueBwPages = 0;
+    dbCache.users[targetUid].dueAmountBdt = 0;
+    dbCache.users[targetUid].dueResetFlag = true;
+  }
 
   if (db) {
     try {
@@ -591,18 +732,15 @@ app.post('/api/jobs/:id/cancel', requireGoogleUser, async (req, res) => {
     memJob.status = 'cancelled';
     if (fs.existsSync(memJob.filePath)) fs.unlink(memJob.filePath, () => {});
   }
+  const cachedJob = dbCache.jobs.find(j => j.id === jobId);
+  if (cachedJob) {
+    if (!req.user.isAdmin && cachedJob.uid !== req.user.uid) {
+      return res.status(403).json({ error: 'Not allowed' });
+    }
+    cachedJob.status = 'cancelled';
+  }
   if (db) {
-    try {
-      const docRef = db.collection('print_jobs').doc(jobId);
-      const snap = await docRef.get();
-      if (snap.exists) {
-        const d = snap.data();
-        if (!req.user.isAdmin && d.uid !== req.user.uid) {
-          return res.status(403).json({ error: 'Not allowed' });
-        }
-        await docRef.update({ status: 'cancelled' });
-      }
-    } catch (e) {}
+    db.collection('print_jobs').doc(jobId).update({ status: 'cancelled' }).catch(() => {});
   }
   res.json({ ok: true });
 });
@@ -631,6 +769,7 @@ app.get('/api/esp/poll', requireDeviceToken, (req, res) => {
   nextJob.status = 'printing';
   nextJob.progress = 0;
   nextJob.printingAt = Date.now();
+  cacheUpsertJob({ id: nextJob.id, status: 'printing' });
   if (db) {
     db.collection('print_jobs').doc(nextJob.id).update({ status: 'printing' }).catch(() => {});
   }
@@ -691,106 +830,92 @@ app.get('/api/status', requireGoogleUser, async (req, res) => {
   const espOnline = (Date.now() - lastEspSeen) < 15000;
   const isAdmin = req.user.isAdmin;
 
+  await ensureDbCacheLoaded();
+
   let summary = { totalJobs: 0, totalPages: 0, colorPages: 0, bwPages: 0, dueAmountBdt: 0 };
   let recentJobs = [];
   let allUsers = [];
 
-  if (db) {
-    try {
-      if (isAdmin) {
-        const sumDoc = await db.collection('stats').doc('summary').get();
-        if (sumDoc.exists) {
-          const d = sumDoc.data();
-          summary.totalJobs = d.totalJobs || 0;
-          summary.totalPages = d.totalPages || 0;
-          summary.colorPages = d.colorPages || 0;
-          summary.bwPages = d.bwPages || 0;
-        }
+  if (dbCache.loaded || Object.keys(dbCache.users).length > 0 || dbCache.jobs.length > 0) {
+    const activeIds = new Set(jobs.map(j => j.id));
+    const tenMinAgo = Date.now() - 10 * 60 * 1000;
 
-        const jobsSnap = await db.collection('print_jobs').orderBy('timestamp', 'desc').limit(30).get();
-        const activeIds = new Set(jobs.map(j => j.id));
-        const tenMinAgo = Date.now() - 10 * 60 * 1000;
-        recentJobs = jobsSnap.docs.map(doc => {
-          const d = doc.data();
-          let st = d.status;
-          if ((st === 'queued' || st === 'printing') && !activeIds.has(d.jobId || doc.id)) {
-            const ts = d.createdAt ? Date.parse(d.createdAt) : 0;
-            if (ts && ts < tenMinAgo) {
-              st = 'expired';
-              doc.ref.update({ status: 'expired' }).catch(() => {});
-            }
+    if (isAdmin) {
+      summary.totalJobs = dbCache.summary.totalJobs || 0;
+      summary.totalPages = dbCache.summary.totalPages || 0;
+      summary.colorPages = dbCache.summary.colorPages || 0;
+      summary.bwPages = dbCache.summary.bwPages || 0;
+
+      recentJobs = dbCache.jobs.slice(0, 30).map(d => {
+        let st = d.status;
+        if ((st === 'queued' || st === 'printing') && !activeIds.has(d.id)) {
+          const ts = d.createdAt ? Date.parse(d.createdAt) : 0;
+          if (ts && ts < tenMinAgo) {
+            st = 'expired';
+            d.status = 'expired';
+            if (db) db.collection('print_jobs').doc(d.id).update({ status: 'expired' }).catch(() => {});
           }
-          return {
-            id: d.jobId || doc.id,
-            name: d.name,
-            userEmail: d.userEmail || '',
-            device: d.device || d.source,
-            colorMode: d.colorMode || 'Color',
-            totalPages: d.totalPages || 1,
-            costBdt: typeof d.costBdt === 'number'
-              ? d.costBdt
-              : computeDueBdt(d.colorMode === 'Color' ? (d.totalPages || 1) : 0, d.colorMode === 'B&W' ? (d.totalPages || 1) : 0),
-            status: st,
-            ...getJobQueueMeta(d.jobId || doc.id, st),
-            createdAt: d.createdAt
-          };
-        });
-
-        const usersSnap = await db.collection('users').get();
-        let totalUnpaidBdt = 0;
-        allUsers = usersSnap.docs.map(doc => {
-          const u = doc.data();
-          const dueBdt = resolveUserDueBdt(u);
-          totalUnpaidBdt += dueBdt;
-          return {
-            uid: u.uid || doc.id,
-            email: u.email || '',
-            name: u.name || '',
-            role: u.role || 'user',
-            totalJobs: u.totalJobs || 0,
-            totalPages: u.totalPages || 0,
-            colorPages: u.colorPages || 0,
-            bwPages: u.bwPages || 0,
-            dueAmountBdt: dueBdt,
-            lastDevice: u.lastDevice || '—'
-          };
-        }).sort((a, b) => (b.dueAmountBdt - a.dueAmountBdt) || (b.totalPages - a.totalPages));
-        summary.dueAmountBdt = totalUnpaidBdt;
-      } else {
-        const userDoc = await db.collection('users').doc(req.user.uid).get();
-        if (userDoc.exists) {
-          const u = userDoc.data();
-          summary = {
-            totalJobs: u.totalJobs || 0,
-            totalPages: u.totalPages || 0,
-            colorPages: u.colorPages || 0,
-            bwPages: u.bwPages || 0,
-            dueAmountBdt: resolveUserDueBdt(u)
-          };
         }
+        return {
+          id: d.id,
+          name: d.name,
+          userEmail: d.userEmail || '',
+          device: d.device || d.source,
+          colorMode: d.colorMode || 'Color',
+          totalPages: d.totalPages || 1,
+          costBdt: typeof d.costBdt === 'number'
+            ? d.costBdt
+            : computeDueBdt(d.colorMode === 'Color' ? (d.totalPages || 1) : 0, d.colorMode === 'B&W' ? (d.totalPages || 1) : 0),
+          status: st,
+          ...getJobQueueMeta(d.id, st),
+          createdAt: d.createdAt
+        };
+      });
 
-        const myJobsSnap = await db.collection('print_jobs').where('uid', '==', req.user.uid).limit(50).get();
-        recentJobs = myJobsSnap.docs
-          .map(doc => {
-            const d = doc.data();
-            return {
-              id: d.jobId || doc.id,
-              name: d.name,
-              colorMode: d.colorMode || 'Color',
-              totalPages: d.totalPages || 1,
-              costBdt: typeof d.costBdt === 'number'
-                ? d.costBdt
-                : computeDueBdt(d.colorMode === 'Color' ? (d.totalPages || 1) : 0, d.colorMode === 'B&W' ? (d.totalPages || 1) : 0),
-              status: d.status,
-              ...getJobQueueMeta(d.jobId || doc.id, d.status),
-              createdAt: d.createdAt
-            };
-          })
-          .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)))
-          .slice(0, 20);
+      let totalUnpaidBdt = 0;
+      allUsers = Object.values(dbCache.users).map(u => {
+        const dueBdt = resolveUserDueBdt(u);
+        totalUnpaidBdt += dueBdt;
+        return {
+          uid: u.uid,
+          email: u.email || '',
+          name: u.name || '',
+          role: u.role || 'user',
+          totalJobs: u.totalJobs || 0,
+          totalPages: u.totalPages || 0,
+          colorPages: u.colorPages || 0,
+          bwPages: u.bwPages || 0,
+          dueAmountBdt: dueBdt,
+          lastDevice: u.lastDevice || '—'
+        };
+      }).sort((a, b) => (b.dueAmountBdt - a.dueAmountBdt) || (b.totalPages - a.totalPages));
+      summary.dueAmountBdt = totalUnpaidBdt;
+    } else {
+      const u = dbCache.users[req.user.uid];
+      if (u) {
+        summary = {
+          totalJobs: u.totalJobs || 0,
+          totalPages: u.totalPages || 0,
+          colorPages: u.colorPages || 0,
+          bwPages: u.bwPages || 0,
+          dueAmountBdt: resolveUserDueBdt(u)
+        };
       }
-    } catch (err) {
-      console.error('[Firestore] Read error:', err.message);
+      recentJobs = dbCache.jobs
+        .filter(d => d.uid === req.user.uid)
+        .slice(0, 20)
+        .map(d => ({
+          id: d.id,
+          name: d.name,
+          colorMode: d.colorMode || 'Color',
+          totalPages: d.totalPages || 1,
+          costBdt: typeof d.costBdt === 'number'
+            ? d.costBdt
+            : computeDueBdt(d.colorMode === 'Color' ? (d.totalPages || 1) : 0, d.colorMode === 'B&W' ? (d.totalPages || 1) : 0),
+          status: d.status,
+          ...getJobQueueMeta(d.id, d.status),
+          createdAt: d.createdAt
+        }));
     }
   } else {
     const visible = isAdmin ? jobs : jobs.filter(j => j.uid === req.user.uid);
@@ -821,4 +946,5 @@ app.get('/api/status', requireGoogleUser, async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`[Server] Cloud Print Relay listening on port ${PORT}`);
+  ensureDbCacheLoaded();
 });
