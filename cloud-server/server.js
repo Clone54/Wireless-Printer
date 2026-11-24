@@ -324,6 +324,41 @@ async function getSelectedPageList(filePath, ext, pageMode, customPages) {
   return Array.from({ length: totalPdfPages }, (_, i) => i + 1);
 }
 
+
+async function detectPdfPageColors(filePath, totalPdfPages) {
+  const map = {};
+  try {
+    const res = await runFilter('gs', ['-q', '-o', '-', '-sDEVICE=inkcov', filePath], null);
+    const lines = res.stdout.toString('utf8').split(/\r?\n/).filter(l => l.includes('CMYK'));
+    if (lines.length > 0) {
+      lines.forEach((line, idx) => {
+        const m = line.trim().match(/^([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)/);
+        if (m) {
+          const c = parseFloat(m[1]) || 0;
+          const mag = parseFloat(m[2]) || 0;
+          const y = parseFloat(m[3]) || 0;
+          map[idx + 1] = (c > 0.001 || mag > 0.001 || y > 0.001);
+        }
+      });
+      return map;
+    }
+  } catch (e) {}
+  for (let p = 1; p <= totalPdfPages; p++) map[p] = true;
+  return map;
+}
+
+async function detectImageIsColor(filePath) {
+  try {
+    const res = await runFilter('convert', [
+      filePath, '-resize', '256x256>', '-colorspace', 'HSL', '-channel', 'S', '-separate', '+channel',
+      '-format', '%[fx:maxima]', 'info:'
+    ], null);
+    const maxSat = parseFloat(res.stdout.toString('utf8').trim());
+    if (Number.isFinite(maxSat)) return maxSat > 0.04;
+  } catch (e) {}
+  return true;
+}
+
 async function countSelectedPages(filePath, ext, pageMode, customPages) {
   const list = await getSelectedPageList(filePath, ext, pageMode, customPages);
   return list.length;
@@ -455,8 +490,8 @@ async function saveJobToFirestore(job) {
 async function updateJobStatusInFirestore(job, ok) {
   cacheUpsertJob({ id: job.id, status: job.status });
   if (ok) {
-    const colorInc = job.colorMode === 'Color' ? job.totalPages : 0;
-    const bwInc = job.colorMode === 'B&W' ? job.totalPages : 0;
+    const colorInc = typeof job.colorSheets === 'number' ? job.colorSheets : (job.colorMode === 'Color' ? job.totalPages : 0);
+    const bwInc = typeof job.bwSheets === 'number' ? job.bwSheets : (job.colorMode === 'B&W' ? job.totalPages : 0);
     const costInc = computeDueBdt(colorInc, bwInc);
     dbCache.summary.totalJobs = (dbCache.summary.totalJobs || 0) + 1;
     dbCache.summary.totalPages = (dbCache.summary.totalPages || 0) + job.totalPages;
@@ -489,8 +524,8 @@ async function updateJobStatusInFirestore(job, ok) {
     });
     if (ok) {
       const inc = admin.firestore.FieldValue.increment;
-      const colorInc = job.colorMode === 'Color' ? job.totalPages : 0;
-      const bwInc = job.colorMode === 'B&W' ? job.totalPages : 0;
+      const colorInc = typeof job.colorSheets === 'number' ? job.colorSheets : (job.colorMode === 'Color' ? job.totalPages : 0);
+      const bwInc = typeof job.bwSheets === 'number' ? job.bwSheets : (job.colorMode === 'B&W' ? job.totalPages : 0);
       const costInc = computeDueBdt(colorInc, bwInc);
 
       await db.collection('stats').doc('summary').set({
@@ -652,13 +687,41 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
   }
   const sheetsPerCopy = Math.ceil(selectedPages / pagesPerSheet);
   const totalPages = sheetsPerCopy * copies;
-  const costBdt = colorMode === 'Color' ? (totalPages * rateColorBdt) : (totalPages * rateBwBdt);
+
+  // Smart Color Detection: even if user selects Color, colorless sheets are billed & printed as B&W
+  const sheetGroupsAll = [];
+  for (let i = 0; i < selectedPageList.length; i += pagesPerSheet) {
+    sheetGroupsAll.push(selectedPageList.slice(i, i + pagesPerSheet));
+  }
+  if (pageOrder === 'reverse') sheetGroupsAll.reverse();
+
+  let sheetIsColor = sheetGroupsAll.map(() => !isGray);
+  if (!isGray) {
+    if (ext === '.pdf') {
+      const maxP = Math.max(...selectedPageList, 1);
+      const pageColorMap = await detectPdfPageColors(inputPath, maxP);
+      sheetIsColor = sheetGroupsAll.map(grp => grp.some(p => pageColorMap[p] !== false));
+    } else {
+      const imgColor = await detectImageIsColor(inputPath);
+      sheetIsColor = sheetGroupsAll.map(() => imgColor);
+    }
+  }
+
+  const colorSheetsPerCopy = sheetIsColor.filter(Boolean).length;
+  const bwSheetsPerCopy = sheetIsColor.length - colorSheetsPerCopy;
+  const colorSheets = colorSheetsPerCopy * copies;
+  const bwSheets = bwSheetsPerCopy * copies;
+  const effectiveColorMode = (colorSheets > 0 && bwSheets > 0)
+    ? `Mixed (${colorSheets}C+${bwSheets}B)`
+    : (colorSheets > 0 ? 'Color' : 'B&W');
+  const effectiveInk = (colorSheets === 0) ? 'MONO' : ink;
+  const costBdt = computeDueBdt(colorSheets, bwSheets);
   const devInfo = parseDeviceInfo(req);
 
   const baseCupsOpts = [
     '-o', `PageSize=${paper}`,
     '-o', `media=${paper}`,
-    '-o', `Ink=${ink}`,
+    '-o', `Ink=${effectiveInk}`,
     '-o', `MediaType=${quality}`,
     '-o', 'fit-to-page'
   ];
@@ -692,40 +755,54 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
     // Automatic Threshold-Based Page Chunking:
     // If <= 6.5 MB, keep as 1 single continuous file (zero extra pauses).
     // If > 6.5 MB on a multi-sheet PDF, split into ~3.5 MB sub-chunks so every chunk fits 100% in ESP32-S3 PSRAM!
-    if (ext === '.pdf' && finalBuf.length > PSRAM_CHUNK_THRESHOLD && sheetsPerCopy > 1) {
+    const hasMixedRuns = (ext === '.pdf' && colorSheets > 0 && bwSheets > 0 && sheetsPerCopy > 1);
+    if (hasMixedRuns || (ext === '.pdf' && finalBuf.length > PSRAM_CHUNK_THRESHOLD && sheetsPerCopy > 1)) {
       const avgSheetBytes = Math.ceil(finalBuf.length / totalPages);
       const maxSheetsPerChunk = Math.max(1, Math.floor(3800000 / Math.max(1, avgSheetBytes)));
       const pagesPerChunk = maxSheetsPerChunk * pagesPerSheet;
 
-      const sheetGroups = [];
-      for (let i = 0; i < selectedPageList.length; i += pagesPerSheet) {
-        sheetGroups.push(selectedPageList.slice(i, i + pagesPerSheet));
-      }
-      if (pageOrder === 'reverse') {
-        sheetGroups.reverse();
-      }
       const sheetsPerGroup = Math.max(1, Math.floor(pagesPerChunk / pagesPerSheet));
       const chunkPageBatches = [];
-      for (let i = 0; i < sheetGroups.length; i += sheetsPerGroup) {
-        const groupSlice = sheetGroups.slice(i, i + sheetsPerGroup);
-        if (pageOrder === 'reverse') groupSlice.reverse();
-        const flatPages = [];
-        for (const g of groupSlice) {
-          for (const p of g) flatPages.push(p);
+      let curBatch = [];
+      let curInk = null;
+      for (let i = 0; i < sheetGroupsAll.length; i++) {
+        const sInk = sheetIsColor[i] ? 'COLOR' : 'MONO';
+        if (curBatch.length > 0 && ((hasMixedRuns && sInk !== curInk) || curBatch.length >= sheetsPerGroup)) {
+          chunkPageBatches.push({ groups: curBatch, ink: curInk });
+          curBatch = [];
         }
-        flatPages.sort((a, b) => a - b);
-        chunkPageBatches.push(flatPages);
+        curInk = sInk;
+        curBatch.push(sheetGroupsAll[i]);
       }
+      if (curBatch.length > 0) chunkPageBatches.push({ groups: curBatch, ink: curInk });
 
       totalSize = 0;
       let chunkSuccess = true;
       for (let c = 0; c < copies && chunkSuccess; c++) {
         for (let bIdx = 0; bIdx < chunkPageBatches.length; bIdx++) {
-          const batchPages = chunkPageBatches[bIdx];
-          const rangeSpec = batchPages.join(',');
-          const chunkOpts = [...baseCupsOpts, '-o', `page-ranges=${rangeSpec}`];
+          const batchObj = chunkPageBatches[bIdx];
+          const groupSlice = pageOrder === 'reverse' ? [...batchObj.groups].reverse() : batchObj.groups;
+          const flatPages = [];
+          for (const g of groupSlice) {
+            for (const p of g) flatPages.push(p);
+          }
+          flatPages.sort((a, b) => a - b);
+          const rangeSpec = flatPages.join(',');
+          const chunkInk = batchObj.ink || effectiveInk;
+          const chunkOpts = [
+            '-o', `PageSize=${paper}`,
+            '-o', `media=${paper}`,
+            '-o', `Ink=${chunkInk}`,
+            '-o', `MediaType=${quality}`,
+            '-o', 'fit-to-page'
+          ];
+          if (orientation === 'landscape') chunkOpts.push('-o', 'landscape');
+          if (pageOrder === 'reverse') chunkOpts.push('-o', 'outputorder=reverse');
+          if (pagesPerSheet > 1) chunkOpts.push('-o', `number-up=${pagesPerSheet}`);
+          chunkOpts.push('-o', `page-ranges=${rangeSpec}`);
+          const chunkOptsStr = `PageSize=${paper} media=${paper} Ink=${chunkInk} MediaType=${quality} fit-to-page`;
           const cRes = await renderEscprBuffer({
-            inputPath, ext, originalName, paper, cupsOpts: chunkOpts, copies: 1, optsStr, envVars
+            inputPath, ext, originalName, paper, cupsOpts: chunkOpts, copies: 1, optsStr: chunkOptsStr, envVars
           });
           if (!isValidEscpr(cRes.finalBuf)) {
             chunkSuccess = false;
@@ -766,7 +843,9 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
       source: 'Web/Phone',
       device: devInfo.device,
       ip: devInfo.ip,
-      colorMode,
+      colorMode: effectiveColorMode,
+      colorSheets,
+      bwSheets,
       pagesPerCopy: sheetsPerCopy,
       pagesPerSheet,
       copies,
@@ -787,7 +866,7 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
     jobs.push(job);
     await saveJobToFirestore(job);
     console.log(`[Queue] Job ${jobId} by ${req.user.email} (${totalPages}p ${colorMode}, ${costBdt} BDT, ${chunks.length} chunk(s))`);
-    return res.json({ ok: true, job: { id: job.id, name: job.name, size: job.size, totalPages, colorMode, costBdt, status: job.status } });
+    return res.json({ ok: true, job: { id: job.id, name: job.name, size: job.size, totalPages, colorSheets, bwSheets, colorMode: effectiveColorMode, costBdt, status: job.status } });
   } catch (e) {
     cleanup();
     return res.status(500).json({ error: `Conversion exception: ${e.message}` });

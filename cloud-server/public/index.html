@@ -458,6 +458,8 @@
     let resizeTimer = null;
     let rateColorBdt = 4;
     let rateBwBdt = 3;
+    let detectedColorSheets = null;
+    let detectedBwSheets = null;
     const jobWaitHistory = {};
 
     setInterval(() => {
@@ -761,6 +763,39 @@
       return [1, 1];
     }
 
+    function canvasHasColor(canvas) {
+      try {
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        const { width, height } = canvas;
+        const data = ctx.getImageData(0, 0, width, height).data;
+        const step = 16; // sample every 4th pixel (4 channels * 4)
+        for (let i = 0; i < data.length; i += step) {
+          const a = data[i + 3];
+          if (a < 20) continue;
+          const r = data[i], g = data[i + 1], b = data[i + 2];
+          if (Math.abs(r - g) > 14 || Math.abs(g - b) > 14 || Math.abs(r - b) > 14) {
+            return true;
+          }
+        }
+        return false;
+      } catch (e) {
+        return true;
+      }
+    }
+
+    function imgHasColor(img) {
+      try {
+        const c = document.createElement('canvas');
+        c.width = Math.min(200, img.naturalWidth || 200);
+        c.height = Math.min(200, img.naturalHeight || 200);
+        const ctx = c.getContext('2d');
+        ctx.drawImage(img, 0, 0, c.width, c.height);
+        return canvasHasColor(c);
+      } catch (e) {
+        return true;
+      }
+    }
+
     function updateEstimate(selectedCount = null) {
       const nUp = parseInt(document.getElementById('pagesPerSheet').value, 10) || 1;
       const orderLabel = document.getElementById('pageOrder').value === 'normal' ? 'First to Last' : 'Last to First';
@@ -773,11 +808,20 @@
         return;
       }
       const copies = Math.max(1, Math.min(20, parseInt(document.getElementById('copies').value || '1', 10) || 1));
-      const sheets = Math.ceil(count / nUp) * copies;
+      const sheetsPerCopy = Math.ceil(count / nUp);
+      const sheets = sheetsPerCopy * copies;
       const isColor = document.getElementById('color').value !== 'Gray';
-      const cost = Math.round(sheets * (isColor ? rateColorBdt : rateBwBdt) * 100) / 100;
-      document.getElementById('estText').textContent = `${count} page(s) → ${sheets} physical sheet(s)`;
-      document.getElementById('estCost').textContent = `${cost} BDT`;
+      if (isColor && detectedColorSheets !== null && detectedBwSheets !== null && (detectedColorSheets + detectedBwSheets) === sheetsPerCopy) {
+        const cSheets = detectedColorSheets * copies;
+        const bSheets = detectedBwSheets * copies;
+        const cost = Math.round(((cSheets * rateColorBdt) + (bSheets * rateBwBdt)) * 100) / 100;
+        document.getElementById('estText').textContent = `${cSheets} Color + ${bSheets} B&W → ${sheets} sheet(s)`;
+        document.getElementById('estCost').textContent = `${cost} BDT`;
+      } else {
+        const cost = Math.round(sheets * (isColor ? rateColorBdt : rateBwBdt) * 100) / 100;
+        document.getElementById('estText').textContent = `${count} page(s) → ${sheets} physical sheet(s)`;
+        document.getElementById('estCost').textContent = `${cost} BDT`;
+      }
     }
 
     async function handleFileSelect() {
@@ -789,6 +833,8 @@
       currentPdfDoc = null;
       currentFileIsPdf = false;
       totalLoadedPages = 0;
+      detectedColorSheets = null;
+      detectedBwSheets = null;
 
       if (!file) {
         meta.textContent = 'Supports PDF, PNG, JPG (max 25 MB)';
@@ -854,6 +900,8 @@
 
       box.innerHTML = '';
       const maxSheetsToRender = Math.min(totalSheets, 12);
+      let cCount = 0;
+      let bCount = 0;
 
       for (let s = 0; s < maxSheetsToRender; s++) {
         if (myToken !== renderToken) return;
@@ -866,6 +914,7 @@
         sheet.style.gridTemplateRows = `repeat(${rows}, 1fr)`;
 
         const slice = orderedPages.slice(s * nUp, (s + 1) * nUp);
+        let sheetColor = false;
         for (const pageNum of slice) {
           const cell = document.createElement('div');
           cell.className = 'sheet-cell';
@@ -882,22 +931,40 @@
             canvas.width = scaledVp.width;
             canvas.height = scaledVp.height;
             await page.render({ canvasContext: canvas.getContext('2d'), viewport: scaledVp }).promise;
+            if (!isBw && canvasHasColor(canvas)) sheetColor = true;
             cell.appendChild(canvas);
           } else if (currentImgUrl) {
             const img = document.createElement('img');
             img.src = currentImgUrl;
+            await new Promise(r => { img.onload = r; img.onerror = r; });
+            if (!isBw && imgHasColor(img)) sheetColor = true;
             cell.appendChild(img);
           }
           sheet.appendChild(cell);
         }
 
+        if (!isBw) {
+          if (sheetColor) cCount++; else bCount++;
+        } else {
+          bCount++;
+        }
+
         const lbl = document.createElement('div');
         lbl.className = 'sheet-label';
-        lbl.textContent = `Sheet ${s + 1} (Pages: ${slice.join(', ')})`;
+        lbl.textContent = `Sheet ${s + 1} (Pages: ${slice.join(', ')}) • ${(!isBw && sheetColor) ? 'Color' : 'B&W'}`;
 
         box.appendChild(sheet);
         box.appendChild(lbl);
       }
+
+      if (totalSheets <= maxSheetsToRender) {
+        detectedColorSheets = cCount;
+        detectedBwSheets = bCount;
+      } else {
+        detectedColorSheets = null;
+        detectedBwSheets = null;
+      }
+      updateEstimate(selectedPages.length);
 
       if (totalSheets > maxSheetsToRender) {
         const more = document.createElement('div');
@@ -954,7 +1021,7 @@
           tbody.innerHTML = `<tr><td colspan="${isAdmin ? 8 : 6}" class="sub">No print jobs yet.</td></tr>`;
         } else {
           tbody.innerHTML = data.jobs.map(j => {
-            const isColor = j.colorMode !== 'B&W';
+            const isColor = j.colorMode && j.colorMode !== 'B&W';
             const timeStr = j.createdAt ? new Date(j.createdAt).toLocaleString() : '—';
             const costStr = `${typeof j.costBdt === "number" ? j.costBdt : ((j.totalPages || 1) * (isColor ? rateColorBdt : rateBwBdt))} BDT`;
             if (j.status === 'queued' && j.waitingPages > 0) {
