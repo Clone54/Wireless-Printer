@@ -254,8 +254,13 @@
       <div class="header-right">
         <span id="roleBadge" class="badge admin-tag hidden">Admin</span>
         <span id="espBadge" class="badge off">Checking...</span>
+        <button class="btn-ghost hidden" id="pauseQueueBtn" onclick="toggleQueuePause()">Pause Queue</button>
         <button class="btn-ghost" onclick="logout()">Sign Out</button>
       </div>
+    </div>
+
+    <div id="queuePausedBanner" class="hidden" style="background:rgba(245,158,11,0.14);border:1px solid rgba(245,158,11,0.4);color:#fde68a;border-radius:12px;padding:11px 16px;font-size:13px;font-weight:500;">
+      Queue is currently paused by Admin — you can still upload jobs, and printing will resume shortly.
     </div>
 
     <div class="stats-grid">
@@ -364,6 +369,17 @@
             <span>More Settings</span>
             <span style="font-size:11px;color:#94a3b8;" id="moreSummary">Last to First • 1/sheet</span>
           </summary>
+          <label for="layoutPreset">ID Card / Photo Preset</label>
+          <select id="layoutPreset" onchange="togglePresetBack(); renderPreview();">
+            <option value="none">Normal Document / Photo</option>
+            <option value="id_card">ID Card / NID (Front + Back on 1 Sheet)</option>
+            <option value="passport_4">Passport Photos (4× on Sheet)</option>
+            <option value="passport_8">Passport Photos (8× on Sheet)</option>
+          </select>
+          <div id="idBackWrap" class="hidden">
+            <label for="backFile">Back Side of ID Card (Optional — PNG/JPG)</label>
+            <input id="backFile" type="file" accept=".png,.jpg,.jpeg,.pdf,image/*,application/pdf" onchange="handleBackSelect()" />
+          </div>
           <label for="pageOrder">Print Order</label>
           <select id="pageOrder" onchange="renderPreview()">
             <option value="reverse" selected>Last to First</option>
@@ -450,6 +466,8 @@
     let isAdmin = false;
     let currentPdfDoc = null;
     let currentImgUrl = null;
+    let backImgUrl = null;
+    let currentQueuePaused = false;
     let currentFileIsPdf = false;
     let totalLoadedPages = 0;
     let statusTimer = null;
@@ -653,6 +671,7 @@
       document.getElementById('roleBadge').classList.toggle('hidden', !isAdmin);
       document.getElementById('adminUsersCard').classList.toggle('hidden', !isAdmin);
       document.getElementById('adminRatesCard').classList.toggle('hidden', !isAdmin);
+      document.getElementById('pauseQueueBtn').classList.toggle('hidden', !isAdmin);
       document.getElementById('lblTotalPages').textContent = isAdmin ? 'All Users Pages' : 'Your Total Pages';
       document.getElementById('lblTotalJobs').textContent = isAdmin ? 'All Print Jobs' : 'Your Print Jobs';
       document.getElementById('lblDueAmount').textContent = isAdmin ? 'Total Unpaid Dues' : 'Your Due Amount';
@@ -699,6 +718,33 @@
           method: 'POST',
           headers: { 'Authorization': `Bearer ${idToken}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ uid })
+        });
+        if (res.ok) refreshStatus();
+      } catch (e) {}
+    }
+
+    function togglePresetBack() {
+      const preset = document.getElementById('layoutPreset').value;
+      document.getElementById('idBackWrap').classList.toggle('hidden', preset !== 'id_card');
+    }
+
+    function handleBackSelect() {
+      const f = document.getElementById('backFile').files[0];
+      if (backImgUrl) { URL.revokeObjectURL(backImgUrl); backImgUrl = null; }
+      if (f && f.type.startsWith('image/')) {
+        backImgUrl = URL.createObjectURL(f);
+      }
+      renderPreview();
+    }
+
+    async function toggleQueuePause() {
+      if (!currentUser || !isAdmin) return;
+      try {
+        const idToken = await currentUser.getIdToken();
+        const res = await fetch('/api/admin/queue-toggle', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${idToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ paused: !currentQueuePaused })
         });
         if (res.ok) refreshStatus();
       } catch (e) {}
@@ -797,9 +843,13 @@
     }
 
     function updateEstimate(selectedCount = null) {
-      const nUp = parseInt(document.getElementById('pagesPerSheet').value, 10) || 1;
+      const preset = document.getElementById('layoutPreset').value;
+      const nUp = preset === 'none' ? (parseInt(document.getElementById('pagesPerSheet').value, 10) || 1) : 1;
       const orderLabel = document.getElementById('pageOrder').value === 'normal' ? 'First to Last' : 'Last to First';
-      document.getElementById('moreSummary').textContent = `${orderLabel} • ${nUp}/sheet`;
+      const presetLabels = { id_card: 'ID Card', passport_4: 'Passport 4×', passport_8: 'Passport 8×' };
+      document.getElementById('moreSummary').textContent = preset !== 'none'
+        ? `${presetLabels[preset]} • 1 sheet`
+        : `${orderLabel} • ${nUp}/sheet`;
 
       const count = selectedCount !== null ? selectedCount : getSelectedPageNumbers(totalLoadedPages).length;
       if (count <= 0) {
@@ -808,7 +858,7 @@
         return;
       }
       const copies = Math.max(1, Math.min(20, parseInt(document.getElementById('copies').value || '1', 10) || 1));
-      const sheetsPerCopy = Math.ceil(count / nUp);
+      const sheetsPerCopy = preset !== 'none' ? 1 : Math.ceil(count / nUp);
       const sheets = sheetsPerCopy * copies;
       const isColor = document.getElementById('color').value !== 'Gray';
       if (isColor && detectedColorSheets !== null && detectedBwSheets !== null && (detectedColorSheets + detectedBwSheets) === sheetsPerCopy) {
@@ -871,15 +921,134 @@
       const paper = document.getElementById('paper').value;
       const orientation = document.getElementById('orientation').value;
       const isBw = document.getElementById('color').value === 'Gray';
-      const nUp = parseInt(document.getElementById('pagesPerSheet').value, 10) || 1;
+      const preset = document.getElementById('layoutPreset').value;
+      const nUp = preset === 'none' ? (parseInt(document.getElementById('pagesPerSheet').value, 10) || 1) : 1;
       const [cols, rows] = getNupGrid(nUp);
       const dims = getSheetDims(paper, orientation);
 
+      const badgeTag = preset === 'id_card' ? 'ID Card' : (preset === 'passport_4' ? 'Passport 4×' : (preset === 'passport_8' ? 'Passport 8×' : `${nUp}-up`));
       document.getElementById('previewLayoutBadge').textContent =
-        `${paper} • ${orientation === 'landscape' ? 'Landscape' : 'Portrait'} • ${nUp}-up`;
+        `${paper} • ${orientation === 'landscape' ? 'Landscape' : 'Portrait'} • ${badgeTag}`;
 
       if (totalLoadedPages === 0) {
         updateEstimate(0);
+        return;
+      }
+
+      if (preset !== 'none') {
+        box.innerHTML = '';
+        const sheet = document.createElement('div');
+        sheet.className = 'sheet-frame' + (isBw ? ' bw-sim' : '');
+        sheet.style.width = `${dims.w}px`;
+        sheet.style.height = `${dims.h}px`;
+        sheet.style.display = 'flex';
+        sheet.style.flexDirection = orientation === 'landscape' ? 'row' : 'column';
+        sheet.style.alignItems = 'center';
+        sheet.style.justifyContent = 'center';
+        sheet.style.gap = '10px';
+
+        const makeThumb = async (pageNum, useBack) => {
+          if (useBack && backImgUrl) {
+            const im = document.createElement('img');
+            im.src = backImgUrl;
+            await new Promise(r => { im.onload = r; im.onerror = r; });
+            return im;
+          }
+          if (currentFileIsPdf && currentPdfDoc && pageNum <= totalLoadedPages) {
+            const page = await currentPdfDoc.getPage(pageNum);
+            const vp = page.getViewport({ scale: 1 });
+            const scale = Math.min(240 / vp.width, 240 / vp.height);
+            const scaledVp = page.getViewport({ scale: Math.max(scale, 0.4) });
+            const canvas = document.createElement('canvas');
+            canvas.width = scaledVp.width;
+            canvas.height = scaledVp.height;
+            await page.render({ canvasContext: canvas.getContext('2d'), viewport: scaledVp }).promise;
+            return canvas;
+          }
+          if (currentImgUrl) {
+            const im = document.createElement('img');
+            im.src = currentImgUrl;
+            await new Promise(r => { im.onload = r; im.onerror = r; });
+            return im;
+          }
+          return null;
+        };
+
+        let sheetColor = false;
+        if (preset === 'id_card') {
+          const cardW = Math.round(dims.w * (orientation === 'landscape' ? 0.36 : 0.48));
+          const cardH = Math.round(cardW * (54 / 85.6));
+          const frontEl = await makeThumb(1, false);
+          const backEl = (backImgUrl || (currentFileIsPdf && totalLoadedPages >= 2)) ? await makeThumb(2, true) : null;
+          if (myToken !== renderToken) return;
+          for (const el of [frontEl, backEl].filter(Boolean)) {
+            const c = document.createElement('div');
+            c.style.width = `${cardW}px`;
+            c.style.height = `${cardH}px`;
+            c.style.border = '1px dashed #94a3b8';
+            c.style.overflow = 'hidden';
+            el.style.width = '100%';
+            el.style.height = '100%';
+            el.style.objectFit = 'fill';
+            if (!isBw) {
+              if (el.tagName === 'CANVAS' && canvasHasColor(el)) sheetColor = true;
+              else if (el.tagName === 'IMG' && imgHasColor(el)) sheetColor = true;
+            }
+            c.appendChild(el);
+            sheet.appendChild(c);
+          }
+        } else {
+          const cnt = preset === 'passport_8' ? 8 : 4;
+          const pCols = orientation === 'landscape' ? (cnt === 8 ? 4 : 2) : 2;
+          const pRows = Math.ceil(cnt / pCols);
+          sheet.style.display = 'grid';
+          sheet.style.gridTemplateColumns = `repeat(${pCols}, auto)`;
+          sheet.style.gridTemplateRows = `repeat(${pRows}, auto)`;
+          sheet.style.alignContent = 'center';
+          sheet.style.justifyContent = 'center';
+          sheet.style.gap = '8px';
+          const pw = Math.round(dims.w * (orientation === 'landscape' ? 0.16 : 0.22));
+          const ph = Math.round(pw * (50 / 40));
+          const baseEl = await makeThumb(1, false);
+          if (myToken !== renderToken) return;
+          if (baseEl && !isBw) {
+            if (baseEl.tagName === 'CANVAS' && canvasHasColor(baseEl)) sheetColor = true;
+            else if (baseEl.tagName === 'IMG' && imgHasColor(baseEl)) sheetColor = true;
+          }
+          for (let i = 0; i < cnt; i++) {
+            const c = document.createElement('div');
+            c.style.width = `${pw}px`;
+            c.style.height = `${ph}px`;
+            c.style.border = '1px dashed #94a3b8';
+            c.style.overflow = 'hidden';
+            if (baseEl) {
+              let clone;
+              if (baseEl.tagName === 'CANVAS') {
+                clone = document.createElement('canvas');
+                clone.width = baseEl.width;
+                clone.height = baseEl.height;
+                clone.getContext('2d').drawImage(baseEl, 0, 0);
+              } else {
+                clone = baseEl.cloneNode(true);
+              }
+              clone.style.width = '100%';
+              clone.style.height = '100%';
+              clone.style.objectFit = 'cover';
+              c.appendChild(clone);
+            }
+            sheet.appendChild(c);
+          }
+        }
+
+        detectedColorSheets = (!isBw && sheetColor) ? 1 : 0;
+        detectedBwSheets = (!isBw && sheetColor) ? 0 : 1;
+        updateEstimate(1);
+        document.getElementById('previewSummary').textContent = `1 sheet (${badgeTag})`;
+        const lbl = document.createElement('div');
+        lbl.className = 'sheet-label';
+        lbl.textContent = `Sheet 1 (${badgeTag}) • ${(!isBw && sheetColor) ? 'Color' : 'B&W'}`;
+        box.appendChild(sheet);
+        box.appendChild(lbl);
         return;
       }
 
@@ -982,6 +1151,11 @@
         if (res.status === 401) return;
         const data = await res.json();
         if (data.rates) applyRates(data.rates);
+
+        currentQueuePaused = Boolean(data.queuePaused);
+        document.getElementById('queuePausedBanner').classList.toggle('hidden', !currentQueuePaused);
+        const pBtn = document.getElementById('pauseQueueBtn');
+        if (pBtn) pBtn.textContent = currentQueuePaused ? 'Resume Queue' : 'Pause Queue';
 
         const badge = document.getElementById('espBadge');
         const wifiTag = (isAdmin && data.espOnline && data.espWifiSsid) ? ` • WiFi: ${data.espWifiSsid}` : '';
@@ -1101,6 +1275,12 @@
       form.append('pageOrder', document.getElementById('pageOrder').value);
       form.append('pagesPerSheet', document.getElementById('pagesPerSheet').value);
       form.append('copies', document.getElementById('copies').value);
+      const layoutPreset = document.getElementById('layoutPreset').value;
+      form.append('layoutPreset', layoutPreset);
+      if (layoutPreset === 'id_card') {
+        const bf = document.getElementById('backFile').files[0];
+        if (bf) form.append('backFile', bf);
+      }
 
       try {
         const idToken = await currentUser.getIdToken();

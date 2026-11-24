@@ -13,6 +13,7 @@ const PRINT_TOKEN = process.env.PRINT_TOKEN || 'changeme123';
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'firozahmedshoykot44@gmail.com').toLowerCase();
 let rateColorBdt = 4;
 let rateBwBdt = 3;
+let queuePaused = false;
 const PPD_PATH = '/etc/cups/ppd/epson_l3210.ppd';
 const JOBS_DIR = '/tmp/jobs';
 const UPLOADS_DIR = '/tmp/uploads';
@@ -81,12 +82,16 @@ async function ensureDbCacheLoaded() {
   if (Date.now() - dbCache.lastAttemptMs < 300000) return;
   dbCache.lastAttemptMs = Date.now();
   try {
-    const [sumDoc, jobsSnap, usersSnap, rateDoc] = await Promise.all([
+    const [sumDoc, jobsSnap, usersSnap, rateDoc, queueDoc] = await Promise.all([
       db.collection('stats').doc('summary').get(),
       db.collection('print_jobs').orderBy('timestamp', 'desc').limit(100).get(),
       db.collection('users').get(),
-      db.collection('settings').doc('pricing').get()
+      db.collection('settings').doc('pricing').get(),
+      db.collection('settings').doc('queue').get()
     ]);
+    if (queueDoc.exists) {
+      queuePaused = Boolean(queueDoc.data().paused);
+    }
     if (rateDoc.exists) {
       const rd = rateDoc.data();
       if (typeof rd.colorBdt === 'number' && rd.colorBdt >= 0) rateColorBdt = rd.colorBdt;
@@ -366,6 +371,132 @@ async function countSelectedPages(filePath, ext, pageMode, customPages) {
 
 const PSRAM_CHUNK_THRESHOLD = 6500000; // 6.5 MB threshold (fits safely inside 7 MB ESP32-S3 PSRAM buffer)
 
+
+async function composePresetPdf({ inputPath, ext, backPath, preset, paper, orientation, outPdfPath }) {
+  // 300 DPI page dimensions
+  const dims300 = {
+    A4: [2480, 3508],
+    A5: [1748, 2480],
+    Letter: [2550, 3300]
+  };
+  let [pgW, pgH] = dims300[paper] || dims300.A4;
+  if (orientation === 'landscape') {
+    const tmp = pgW; pgW = pgH; pgH = tmp;
+  }
+
+  const tempFiles = [];
+  const toPng = async (srcPath, srcExt, pageNum, tag) => {
+    if (srcExt === '.pdf') {
+      const prefix = `${inputPath}_${tag}`;
+      await runFilter('pdftoppm', ['-png', '-r', '300', '-f', String(pageNum), '-l', String(pageNum), srcPath, prefix], null);
+      const candidates = fs.readdirSync(path.dirname(prefix)).filter(f => f.startsWith(path.basename(prefix)) && f.endsWith('.png'));
+      if (candidates.length > 0) {
+        const p = path.join(path.dirname(prefix), candidates[0]);
+        tempFiles.push(p);
+        return p;
+      }
+      return null;
+    }
+    return srcPath;
+  };
+
+  try {
+    const frontImg = await toPng(inputPath, ext, 1, 'front');
+    if (!frontImg) return false;
+
+    if (preset === 'id_card') {
+      // Standard CR80 ID card at 300 DPI: 85.6mm x 54mm = 1011 x 638 px
+      const cardW = 1011, cardH = 638;
+      let backImg = null;
+      if (backPath && fs.existsSync(backPath)) {
+        const bExt = path.extname(backPath).toLowerCase() || '.png';
+        backImg = await toPng(backPath, bExt, 1, 'back');
+      } else if (ext === '.pdf') {
+        backImg = await toPng(inputPath, ext, 2, 'back2');
+      }
+
+      const fCard = `${inputPath}_fcard.png`;
+      tempFiles.push(fCard);
+      await runFilter('convert', [
+        frontImg, '-auto-orient', '-resize', `${cardW}x${cardH}!`,
+        '-bordercolor', '#cbd5e1', '-border', '2', fCard
+      ], null);
+
+      const args = ['-size', `${pgW}x${pgH}`, 'xc:white'];
+      if (backImg && fs.existsSync(backImg)) {
+        const bCard = `${inputPath}_bcard.png`;
+        tempFiles.push(bCard);
+        await runFilter('convert', [
+          backImg, '-auto-orient', '-resize', `${cardW}x${cardH}!`,
+          '-bordercolor', '#cbd5e1', '-border', '2', bCard
+        ], null);
+
+        if (orientation === 'landscape') {
+          const gap = 80;
+          const x1 = Math.round((pgW - (cardW * 2 + gap)) / 2);
+          const x2 = x1 + cardW + gap;
+          const y = Math.round((pgH - cardH) / 2);
+          args.push(fCard, '-geometry', `+${x1}+${y}`, '-composite');
+          args.push(bCard, '-geometry', `+${x2}+${y}`, '-composite');
+        } else {
+          const gap = 80;
+          const x = Math.round((pgW - cardW) / 2);
+          const y1 = Math.round((pgH - (cardH * 2 + gap)) / 2);
+          const y2 = y1 + cardH + gap;
+          args.push(fCard, '-geometry', `+${x}+${y1}`, '-composite');
+          args.push(bCard, '-geometry', `+${x}+${y2}`, '-composite');
+        }
+      } else {
+        const x = Math.round((pgW - cardW) / 2);
+        const y = Math.round((pgH - cardH) / 2);
+        args.push(fCard, '-geometry', `+${x}+${y}`, '-composite');
+      }
+      args.push('-density', '300', '-units', 'PixelsPerInch', outPdfPath);
+      const res = await runFilter('convert', args, null);
+      return fs.existsSync(outPdfPath) && res.code === 0;
+    }
+
+    if (preset === 'passport_4' || preset === 'passport_8') {
+      // Standard Passport Photo at 300 DPI: 40mm x 50mm = 472 x 591 px
+      const photoW = 472, photoH = 591;
+      const count = preset === 'passport_8' ? 8 : 4;
+      const cols = orientation === 'landscape' ? (count === 8 ? 4 : 2) : 2;
+      const rows = Math.ceil(count / cols);
+      const gap = 50;
+
+      const tile = `${inputPath}_pp.png`;
+      tempFiles.push(tile);
+      await runFilter('convert', [
+        frontImg, '-auto-orient', '-resize', `${photoW}x${photoH}^`,
+        '-gravity', 'center', '-extent', `${photoW}x${photoH}`,
+        '-bordercolor', '#cbd5e1', '-border', '2', tile
+      ], null);
+
+      const gridW = cols * photoW + (cols - 1) * gap;
+      const gridH = rows * photoH + (rows - 1) * gap;
+      const startX = Math.max(40, Math.round((pgW - gridW) / 2));
+      const startY = Math.max(40, Math.round((pgH - gridH) / 2));
+
+      const args = ['-size', `${pgW}x${pgH}`, 'xc:white'];
+      for (let idx = 0; idx < count; idx++) {
+        const r = Math.floor(idx / cols);
+        const c = idx % cols;
+        const x = startX + c * (photoW + gap);
+        const y = startY + r * (photoH + gap);
+        args.push(tile, '-geometry', `+${x}+${y}`, '-composite');
+      }
+      args.push('-density', '300', '-units', 'PixelsPerInch', outPdfPath);
+      const res = await runFilter('convert', args, null);
+      return fs.existsSync(outPdfPath) && res.code === 0;
+    }
+    return false;
+  } finally {
+    for (const tf of tempFiles) {
+      if (fs.existsSync(tf)) fs.unlink(tf, () => {});
+    }
+  }
+}
+
 async function renderEscprBuffer({ inputPath, ext, originalName, paper, cupsOpts, copies, optsStr, envVars }) {
   const a1 = await runFilter('cupsfilter', [
     '-e', '-p', PPD_PATH, '-d', 'epson_l3210', '-m', 'printer/foo',
@@ -577,6 +708,26 @@ app.post('/api/me', requireGoogleUser, async (req, res) => {
 });
 
 
+
+app.post('/api/admin/queue-toggle', requireGoogleUser, express.json(), async (req, res) => {
+  if (!req.user.isAdmin) {
+    return res.status(403).json({ error: 'Only Admin can pause or resume the queue' });
+  }
+  const nextPaused = (req.body && typeof req.body.paused === 'boolean') ? req.body.paused : !queuePaused;
+  queuePaused = nextPaused;
+  if (db) {
+    try {
+      await db.collection('settings').doc('queue').set({
+        paused: queuePaused,
+        updatedBy: req.user.email,
+        updatedAt: new Date().toISOString()
+      }, { merge: true });
+    } catch (err) {}
+  }
+  console.log(`[Admin] Queue ${queuePaused ? 'PAUSED' : 'RESUMED'} by ${req.user.email}`);
+  res.json({ ok: true, queuePaused });
+});
+
 app.post('/api/admin/rates', requireGoogleUser, express.json(), async (req, res) => {
   if (!req.user.isAdmin) {
     return res.status(403).json({ error: 'Only Admin can change pricing rates' });
@@ -642,18 +793,33 @@ app.post('/api/admin/reset-due', requireGoogleUser, express.json(), async (req, 
   res.json({ ok: true });
 });
 
-app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req, res) => {
-  if (!req.file) {
+app.post('/api/print-file', requireGoogleUser, upload.fields([{ name: 'file', maxCount: 1 }, { name: 'backFile', maxCount: 1 }]), async (req, res) => {
+  const mainFile = (req.files && req.files.file && req.files.file[0]) || req.file;
+  const backUpload = req.files && req.files.backFile && req.files.backFile[0];
+  if (!mainFile) {
+    if (backUpload && fs.existsSync(backUpload.path)) fs.unlink(backUpload.path, () => {});
     return res.status(400).json({ error: 'No file uploaded' });
   }
 
-  const originalName = decodeFilename(req.file.originalname);
-  const ext = path.extname(originalName).toLowerCase() || '.pdf';
-  const inputPath = `${req.file.path}${ext}`;
-  fs.renameSync(req.file.path, inputPath);
+  const originalName = decodeFilename(mainFile.originalname);
+  let ext = path.extname(originalName).toLowerCase() || '.pdf';
+  let inputPath = `${mainFile.path}${ext}`;
+  fs.renameSync(mainFile.path, inputPath);
 
+  let backPath = null;
+  if (backUpload) {
+    const bExt = path.extname(decodeFilename(backUpload.originalname)).toLowerCase() || '.png';
+    backPath = `${backUpload.path}${bExt}`;
+    fs.renameSync(backUpload.path, backPath);
+  }
+
+  const extraCleanup = [];
   const cleanup = () => {
-    fs.unlink(inputPath, () => {});
+    if (fs.existsSync(inputPath)) fs.unlink(inputPath, () => {});
+    if (backPath && fs.existsSync(backPath)) fs.unlink(backPath, () => {});
+    for (const p of extraCleanup) {
+      if (fs.existsSync(p)) fs.unlink(p, () => {});
+    }
   };
 
   if (!fs.existsSync(PPD_PATH)) {
@@ -678,20 +844,45 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
   const quality = ['PLAIN_NORMAL', 'PLAIN_HIGH', 'PMPHOTO_NORMAL'].includes(req.body.quality)
     ? req.body.quality
     : 'PLAIN_NORMAL';
+  const layoutPreset = ['none', 'id_card', 'passport_4', 'passport_8'].includes(req.body.layoutPreset)
+    ? req.body.layoutPreset
+    : 'none';
 
-  const selectedPageList = await getSelectedPageList(inputPath, ext, pageMode, customPages);
+  let activePageMode = pageMode;
+  let activeCustomPages = customPages;
+  let activePagesPerSheet = pagesPerSheet;
+
+  if (layoutPreset !== 'none') {
+    const composedPdf = path.join(JOBS_DIR, `${jobId}_preset.pdf`);
+    extraCleanup.push(composedPdf);
+    const composedOk = await composePresetPdf({
+      inputPath, ext, backPath, preset: layoutPreset, paper, orientation, outPdfPath: composedPdf
+    });
+    if (!composedOk) {
+      cleanup();
+      return res.status(500).json({ error: 'Failed to compose ID Card / Passport Photo sheet.' });
+    }
+    extraCleanup.push(inputPath);
+    inputPath = composedPdf;
+    ext = '.pdf';
+    activePageMode = 'all';
+    activeCustomPages = '';
+    activePagesPerSheet = 1;
+  }
+
+  const selectedPageList = await getSelectedPageList(inputPath, ext, activePageMode, activeCustomPages);
   const selectedPages = selectedPageList.length;
   if (selectedPages === 0) {
     cleanup();
     return res.status(400).json({ error: 'No pages matched your selected page filter.' });
   }
-  const sheetsPerCopy = Math.ceil(selectedPages / pagesPerSheet);
+  const sheetsPerCopy = Math.ceil(selectedPages / activePagesPerSheet);
   const totalPages = sheetsPerCopy * copies;
 
   // Smart Color Detection: even if user selects Color, colorless sheets are billed & printed as B&W
   const sheetGroupsAll = [];
-  for (let i = 0; i < selectedPageList.length; i += pagesPerSheet) {
-    sheetGroupsAll.push(selectedPageList.slice(i, i + pagesPerSheet));
+  for (let i = 0; i < selectedPageList.length; i += activePagesPerSheet) {
+    sheetGroupsAll.push(selectedPageList.slice(i, i + activePagesPerSheet));
   }
   if (pageOrder === 'reverse') sheetGroupsAll.reverse();
 
@@ -727,12 +918,12 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
   ];
   if (orientation === 'landscape') baseCupsOpts.push('-o', 'landscape');
   if (pageOrder === 'reverse') baseCupsOpts.push('-o', 'outputorder=reverse');
-  if (pagesPerSheet > 1) baseCupsOpts.push('-o', `number-up=${pagesPerSheet}`);
+  if (activePagesPerSheet > 1) baseCupsOpts.push('-o', `number-up=${activePagesPerSheet}`);
 
   const cupsOpts = [...baseCupsOpts];
-  if (pageMode === 'odd') cupsOpts.push('-o', 'page-set=odd');
-  else if (pageMode === 'even') cupsOpts.push('-o', 'page-set=even');
-  else if (pageMode === 'custom' && customPages) cupsOpts.push('-o', `page-ranges=${customPages}`);
+  if (activePageMode === 'odd') cupsOpts.push('-o', 'page-set=odd');
+  else if (activePageMode === 'even') cupsOpts.push('-o', 'page-set=even');
+  else if (activePageMode === 'custom' && activeCustomPages) cupsOpts.push('-o', `page-ranges=${activeCustomPages}`);
 
   const optsStr = `PageSize=${paper} media=${paper} Ink=${ink} MediaType=${quality} fit-to-page`;
   const envVars = { PPD: PPD_PATH, PRINTER: 'epson_l3210', CUPS_SERVERROOT: '/etc/cups' };
@@ -1000,6 +1191,7 @@ app.get('/api/esp/poll', requireDeviceToken, (req, res) => {
     return res.status(204).end();
   }
   recoverStuckJobs();
+  if (queuePaused) return res.status(204).end();
   const nextJob = jobs.find(j => j.status === 'queued');
   if (!nextJob) return res.status(204).end();
 
@@ -1219,6 +1411,7 @@ app.get('/api/status', requireGoogleUser, async (req, res) => {
 
   res.json({
     espOnline,
+    queuePaused,
     espPrinterStatus: espOnline ? espPrinterStatus : 'Offline',
     espWifiSsid: (isAdmin && espOnline) ? espWifiSsid : undefined,
     user: req.user,
