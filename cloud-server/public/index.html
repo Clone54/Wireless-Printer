@@ -372,14 +372,15 @@
           <select id="layoutPreset" onchange="togglePresetBack(); renderPreview();">
             <option value="none">Normal Document / Photo</option>
             <option value="id_card">ID Card / NID (Front + Back on 1 Sheet)</option>
-            <option value="passport_4">Passport Photos (4× on Sheet)</option>
-            <option value="passport_8">Passport Photos (8× on Sheet)</option>
+            <option value="passport">Passport Photos (Min 5 Copies)</option>
           </select>
           <div id="idBackWrap" class="hidden">
             <label for="backFile">Back Side of ID Card (Optional — PNG/JPG)</label>
             <input id="backFile" type="file" accept=".png,.jpg,.jpeg,.pdf,image/*,application/pdf" onchange="handleBackSelect()" />
           </div>
           <div id="passportPaperWrap" class="hidden">
+            <label for="passportCopies">Passport Photo Copies (Min 5)</label>
+            <input id="passportCopies" type="number" min="5" max="60" value="5" oninput="renderPreview()" onchange="renderPreview()" />
             <label for="passportMedia">Passport Paper Type</label>
             <select id="passportMedia" onchange="renderPreview()">
               <option value="PLAIN_NORMAL">Plain Paper (Standard Rate)</option>
@@ -732,7 +733,7 @@
     function togglePresetBack() {
       const preset = document.getElementById('layoutPreset').value;
       document.getElementById('idBackWrap').classList.toggle('hidden', preset !== 'id_card');
-      document.getElementById('passportPaperWrap').classList.toggle('hidden', preset !== 'passport_4' && preset !== 'passport_8');
+      document.getElementById('passportPaperWrap').classList.toggle('hidden', preset !== 'passport');
     }
 
     function handleBackSelect() {
@@ -853,9 +854,10 @@
       const preset = document.getElementById('layoutPreset').value;
       const nUp = preset === 'none' ? (parseInt(document.getElementById('pagesPerSheet').value, 10) || 1) : 1;
       const orderLabel = document.getElementById('pageOrder').value === 'normal' ? 'First to Last' : 'Last to First';
-      const presetLabels = { id_card: 'ID Card', passport_4: 'Passport 4×', passport_8: 'Passport 8×' };
+      const ppCopies = Math.max(5, Math.min(60, parseInt(document.getElementById('passportCopies').value || '5', 10) || 5));
+      const presetLabels = { id_card: 'ID Card', passport: `Passport ${ppCopies}×` };
       document.getElementById('moreSummary').textContent = preset !== 'none'
-        ? `${presetLabels[preset]} • 1 sheet`
+        ? `${presetLabels[preset]}`
         : `${orderLabel} • ${nUp}/sheet`;
 
       const count = selectedCount !== null ? selectedCount : getSelectedPageNumbers(totalLoadedPages).length;
@@ -865,13 +867,13 @@
         return;
       }
       const copies = Math.max(1, Math.min(20, parseInt(document.getElementById('copies').value || '1', 10) || 1));
-      const sheetsPerCopy = preset !== 'none' ? 1 : Math.ceil(count / nUp);
+      const isPassport = (preset === 'passport');
+      const ppPerSheet = (document.getElementById('orientation').value === 'landscape') ? 24 : 30;
+      const sheetsPerCopy = preset === 'id_card' ? 1 : (isPassport ? Math.ceil(ppCopies / ppPerSheet) : Math.ceil(count / nUp));
       const sheets = sheetsPerCopy * copies;
-      const isPassport = (preset === 'passport_4' || preset === 'passport_8');
       const passportMedia = document.getElementById('passportMedia').value;
       if (isPassport && passportMedia === 'PMPHOTO_NORMAL') {
-        const photosPerSheet = preset === 'passport_8' ? 8 : 4;
-        const totalPhotos = photosPerSheet * copies;
+        const totalPhotos = ppCopies * copies;
         const cost = totalPhotos * 6;
         document.getElementById('estText').textContent = `${totalPhotos} Photo Glossy copy(s) × 6 BDT (${sheets} sheet)`;
         document.getElementById('estCost').textContent = `${cost} BDT`;
@@ -946,7 +948,8 @@
       const [cols, rows] = getNupGrid(nUp);
       const dims = getSheetDims(paper, orientation);
 
-      const badgeTag = preset === 'id_card' ? 'ID Card' : (preset === 'passport_4' ? 'Passport 4×' : (preset === 'passport_8' ? 'Passport 8×' : `${nUp}-up`));
+      const ppCopies = Math.max(5, Math.min(60, parseInt(document.getElementById('passportCopies').value || '5', 10) || 5));
+      const badgeTag = preset === 'id_card' ? 'ID Card' : (preset === 'passport' ? `Passport ${ppCopies}×` : `${nUp}-up`);
       document.getElementById('previewLayoutBadge').textContent =
         `${paper} • ${orientation === 'landscape' ? 'Landscape' : 'Portrait'} • ${badgeTag}`;
 
@@ -1018,46 +1021,72 @@
             sheet.appendChild(c);
           }
         } else {
-          const cnt = preset === 'passport_8' ? 8 : 4;
-          const pCols = orientation === 'landscape' ? (cnt === 8 ? 4 : 2) : 2;
-          const pRows = Math.ceil(cnt / pCols);
-          sheet.style.display = 'grid';
-          sheet.style.gridTemplateColumns = `repeat(${pCols}, auto)`;
-          sheet.style.gridTemplateRows = `repeat(${pRows}, auto)`;
-          sheet.style.alignContent = 'center';
-          sheet.style.justifyContent = 'center';
-          sheet.style.gap = '8px';
-          const pw = Math.round(dims.w * (orientation === 'landscape' ? 0.16 : 0.22));
-          const ph = Math.round(pw * (50 / 40));
+          const pCols = orientation === 'landscape' ? 6 : 5;
+          const pRows = orientation === 'landscape' ? 4 : 6;
+          const perSheet = pCols * pRows;
+          const totalPpSheets = Math.ceil(ppCopies / perSheet);
+          const padPx = 8;
+          const gapPx = 3;
+          const pw = Math.floor((dims.w - padPx * 2 - gapPx * (pCols - 1)) / pCols);
+          const ph = Math.round(pw * (548 / 448));
+
           const baseEl = await makeThumb(1, false);
           if (myToken !== renderToken) return;
           if (baseEl && !isBw) {
             if (baseEl.tagName === 'CANVAS' && canvasHasColor(baseEl)) sheetColor = true;
             else if (baseEl.tagName === 'IMG' && imgHasColor(baseEl)) sheetColor = true;
           }
-          for (let i = 0; i < cnt; i++) {
-            const c = document.createElement('div');
-            c.style.width = `${pw}px`;
-            c.style.height = `${ph}px`;
-            c.style.border = '1px dashed #94a3b8';
-            c.style.overflow = 'hidden';
-            if (baseEl) {
-              let clone;
-              if (baseEl.tagName === 'CANVAS') {
-                clone = document.createElement('canvas');
-                clone.width = baseEl.width;
-                clone.height = baseEl.height;
-                clone.getContext('2d').drawImage(baseEl, 0, 0);
-              } else {
-                clone = baseEl.cloneNode(true);
+
+          for (let sh = 0; sh < totalPpSheets; sh++) {
+            const shFrame = document.createElement('div');
+            shFrame.className = 'sheet-frame' + (isBw ? ' bw-sim' : '');
+            shFrame.style.width = `${dims.w}px`;
+            shFrame.style.height = `${dims.h}px`;
+            shFrame.style.padding = `${padPx}px`;
+            shFrame.style.display = 'grid';
+            shFrame.style.gridTemplateColumns = `repeat(${pCols}, ${pw}px)`;
+            shFrame.style.gridAutoRows = `${ph}px`;
+            shFrame.style.alignContent = 'start';
+            shFrame.style.justifyContent = 'start';
+            shFrame.style.gap = `${gapPx}px`;
+
+            const startI = sh * perSheet;
+            const endI = Math.min(ppCopies, startI + perSheet);
+            for (let i = startI; i < endI; i++) {
+              const c = document.createElement('div');
+              c.style.width = `${pw}px`;
+              c.style.height = `${ph}px`;
+              c.style.border = '1px solid #cbd5e1';
+              c.style.overflow = 'hidden';
+              if (baseEl) {
+                let clone;
+                if (baseEl.tagName === 'CANVAS') {
+                  clone = document.createElement('canvas');
+                  clone.width = baseEl.width;
+                  clone.height = baseEl.height;
+                  clone.getContext('2d').drawImage(baseEl, 0, 0);
+                } else {
+                  clone = baseEl.cloneNode(true);
+                }
+                clone.style.width = '100%';
+                clone.style.height = '100%';
+                clone.style.objectFit = 'cover';
+                c.appendChild(clone);
               }
-              clone.style.width = '100%';
-              clone.style.height = '100%';
-              clone.style.objectFit = 'cover';
-              c.appendChild(clone);
+              shFrame.appendChild(c);
             }
-            sheet.appendChild(c);
+            const lbl = document.createElement('div');
+            lbl.className = 'sheet-label';
+            lbl.textContent = `Sheet ${sh + 1} (${endI - startI} photos) • ${(!isBw && sheetColor) ? 'Color' : 'B&W'}`;
+            box.appendChild(shFrame);
+            box.appendChild(lbl);
           }
+
+          detectedColorSheets = (!isBw && sheetColor) ? totalPpSheets : 0;
+          detectedBwSheets = (!isBw && sheetColor) ? 0 : totalPpSheets;
+          updateEstimate(1);
+          document.getElementById('previewSummary').textContent = `${ppCopies} photos on ${totalPpSheets} sheet(s)`;
+          return;
         }
 
         detectedColorSheets = (!isBw && sheetColor) ? 1 : 0;
@@ -1298,6 +1327,7 @@
       const layoutPreset = document.getElementById('layoutPreset').value;
       form.append('layoutPreset', layoutPreset);
       form.append('passportMedia', document.getElementById('passportMedia').value);
+      form.append('passportCopies', Math.max(5, Math.min(60, parseInt(document.getElementById('passportCopies').value || '5', 10) || 5)));
       if (layoutPreset === 'id_card') {
         const bf = document.getElementById('backFile').files[0];
         if (bf) form.append('backFile', bf);

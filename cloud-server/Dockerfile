@@ -2,7 +2,7 @@ FROM debian:bookworm-slim
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     nodejs \
     npm \
     cups \
@@ -13,6 +13,11 @@ RUN apt-get update && apt-get install -y \
     ghostscript \
     poppler-utils \
     imagemagick \
+    libreoffice-writer \
+    libreoffice-impress \
+    libreoffice-calc \
+    fonts-liberation \
+    fonts-dejavu-core \
     ca-certificates \
   && rm -rf /var/lib/apt/lists/*
 

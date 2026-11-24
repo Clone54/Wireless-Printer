@@ -390,7 +390,7 @@ async function convertOfficeToPdf(inputPath, outDir) {
   return null;
 }
 
-async function composePresetPdf({ inputPath, ext, backPath, preset, paper, orientation, outPdfPath }) {
+async function composePresetPdf({ inputPath, ext, backPath, preset, passportCopies = 5, paper, orientation, outPdfPath }) {
   // 300 DPI page dimensions
   const dims300 = {
     A4: [2480, 3508],
@@ -474,13 +474,13 @@ async function composePresetPdf({ inputPath, ext, backPath, preset, paper, orien
       return fs.existsSync(outPdfPath) && res.code === 0;
     }
 
-    if (preset === 'passport_4' || preset === 'passport_8') {
-      // Standard Passport Photo at 300 DPI: 40mm x 50mm = 472 x 591 px
-      const photoW = 472, photoH = 591;
-      const count = preset === 'passport_8' ? 8 : 4;
-      const cols = orientation === 'landscape' ? (count === 8 ? 4 : 2) : 2;
-      const rows = Math.ceil(count / cols);
-      const gap = 50;
+    if (preset === 'passport' || preset === 'passport_4' || preset === 'passport_8') {
+      // Row-by-row from top-left: 5 columns x 6 rows on A4 portrait (448x548 px @ 300 DPI)
+      const photoW = 448, photoH = 548, gap = 16, margin = 60;
+      const count = Math.max(5, Math.min(60, parseInt(passportCopies || '5', 10) || 5));
+      const cols = Math.max(1, Math.floor((pgW - 2 * margin + gap) / (photoW + gap)));
+      const rowsPerPage = Math.max(1, Math.floor((pgH - 2 * margin + gap) / (photoH + gap)));
+      const perPage = cols * rowsPerPage;
 
       const tile = `${inputPath}_pp.png`;
       tempFiles.push(tile);
@@ -490,21 +490,29 @@ async function composePresetPdf({ inputPath, ext, backPath, preset, paper, orien
         '-bordercolor', '#cbd5e1', '-border', '2', tile
       ], null);
 
-      const gridW = cols * photoW + (cols - 1) * gap;
-      const gridH = rows * photoH + (rows - 1) * gap;
-      const startX = Math.max(40, Math.round((pgW - gridW) / 2));
-      const startY = Math.max(40, Math.round((pgH - gridH) / 2));
-
-      const args = ['-size', `${pgW}x${pgH}`, 'xc:white'];
-      for (let idx = 0; idx < count; idx++) {
-        const r = Math.floor(idx / cols);
-        const c = idx % cols;
-        const x = startX + c * (photoW + gap);
-        const y = startY + r * (photoH + gap);
-        args.push(tile, '-geometry', `+${x}+${y}`, '-composite');
+      const numSheets = Math.ceil(count / perPage);
+      const sheetPngs = [];
+      for (let sh = 0; sh < numSheets; sh++) {
+        const startIdx = sh * perPage;
+        const endIdx = Math.min(count, startIdx + perPage);
+        const sheetPng = `${inputPath}_ppsh${sh}.png`;
+        tempFiles.push(sheetPng);
+        const args = ['-size', `${pgW}x${pgH}`, 'xc:white'];
+        for (let idx = startIdx; idx < endIdx; idx++) {
+          const localIdx = idx - startIdx;
+          const r = Math.floor(localIdx / cols);
+          const c = localIdx % cols;
+          const x = margin + c * (photoW + gap);
+          const y = margin + r * (photoH + gap);
+          args.push(tile, '-geometry', `+${x}+${y}`, '-composite');
+        }
+        args.push(sheetPng);
+        const r1 = await runFilter('convert', args, null);
+        if (r1.code !== 0 || !fs.existsSync(sheetPng)) return false;
+        sheetPngs.push(sheetPng);
       }
-      args.push('-density', '300', '-units', 'PixelsPerInch', outPdfPath);
-      const res = await runFilter('convert', args, null);
+
+      const res = await runFilter('convert', [...sheetPngs, '-density', '300', '-units', 'PixelsPerInch', outPdfPath], null);
       return fs.existsSync(outPdfPath) && res.code === 0;
     }
     return false;
@@ -862,10 +870,13 @@ app.post('/api/print-file', requireGoogleUser, upload.fields([{ name: 'file', ma
   let quality = ['PLAIN_NORMAL', 'PLAIN_HIGH'].includes(req.body.quality)
     ? req.body.quality
     : 'PLAIN_NORMAL';
-  const layoutPreset = ['none', 'id_card', 'passport_4', 'passport_8'].includes(req.body.layoutPreset)
+  const layoutPreset = ['none', 'id_card', 'passport', 'passport_4', 'passport_8'].includes(req.body.layoutPreset)
     ? req.body.layoutPreset
     : 'none';
-  const isPassportPreset = (layoutPreset === 'passport_4' || layoutPreset === 'passport_8');
+  const isPassportPreset = (layoutPreset === 'passport' || layoutPreset === 'passport_4' || layoutPreset === 'passport_8');
+  const passportCopies = isPassportPreset
+    ? Math.max(5, Math.min(60, parseInt(req.body.passportCopies || '5', 10) || 5))
+    : 0;
   const passportMedia = (isPassportPreset && req.body.passportMedia === 'PMPHOTO_NORMAL')
     ? 'PMPHOTO_NORMAL'
     : 'PLAIN_NORMAL';
@@ -892,7 +903,7 @@ app.post('/api/print-file', requireGoogleUser, upload.fields([{ name: 'file', ma
     const composedPdf = path.join(JOBS_DIR, `${jobId}_preset.pdf`);
     extraCleanup.push(composedPdf);
     const composedOk = await composePresetPdf({
-      inputPath, ext, backPath, preset: layoutPreset, paper, orientation, outPdfPath: composedPdf
+      inputPath, ext, backPath, preset: layoutPreset, passportCopies, paper, orientation, outPdfPath: composedPdf
     });
     if (!composedOk) {
       cleanup();
@@ -939,9 +950,9 @@ app.post('/api/print-file', requireGoogleUser, upload.fields([{ name: 'file', ma
   const colorSheets = colorSheetsPerCopy * copies;
   const bwSheets = bwSheetsPerCopy * copies;
   const isPhotoGlossyPassport = (isPassportPreset && passportMedia === 'PMPHOTO_NORMAL');
-  const photoCountPerSheet = layoutPreset === 'passport_8' ? 8 : (layoutPreset === 'passport_4' ? 4 : 0);
+  const photoCountPerSheet = isPassportPreset ? passportCopies : 0;
   const effectiveColorMode = isPhotoGlossyPassport
-    ? `Photo Glossy (${photoCountPerSheet}×)`
+    ? `Photo Glossy (${passportCopies}×)`
     : ((colorSheets > 0 && bwSheets > 0)
         ? `Mixed (${colorSheets}C+${bwSheets}B)`
         : (colorSheets > 0 ? 'Color' : 'B&W'));
