@@ -4,36 +4,14 @@ const fs = require('fs');
 const https = require('https');
 
 
-function sendAdminTelegram(job) {
+function telegramApi(method, bodyObj) {
   const botToken = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
-  const chatId = (process.env.TELEGRAM_CHAT_ID || '').trim();
-  if (!botToken || !chatId) {
-    console.warn('[Telegram] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set; skipping alert.');
-    return Promise.resolve(false);
-  }
-  const appUrl = (process.env.RENDER_EXTERNAL_URL || 'https://wireless-printer.onrender.com').replace(/\/$/, '');
-  const text = [
-    '📸 New Photo Glossy Print Request',
-    '',
-    `👤 User: ${job.userEmail}`,
-    `📄 File: ${job.name}`,
-    `🖨️ Mode: ${job.colorMode} (${job.totalPages} sheet)`,
-    `💰 Amount: ${job.costBdt} BDT`,
-    '',
-    'Load Photo Glossy paper, then tap Start Print:',
-    appUrl
-  ].join('\n');
-
-  const payload = JSON.stringify({
-    chat_id: chatId,
-    text,
-    disable_web_page_preview: true
-  });
-
+  if (!botToken) return Promise.resolve(null);
+  const payload = JSON.stringify(bodyObj || {});
   return new Promise((resolve) => {
     const req = https.request({
       hostname: 'api.telegram.org',
-      path: `/bot${botToken}/sendMessage`,
+      path: `/bot${botToken}/${method}`,
       method: 'POST',
       headers: {
         'content-type': 'application/json',
@@ -44,23 +22,110 @@ function sendAdminTelegram(job) {
       let body = '';
       res.on('data', d => body += d);
       res.on('end', () => {
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          console.log(`[Telegram] Admin notified for job ${job.id}`);
-          resolve(true);
-        } else {
-          console.error(`[Telegram] Failed (${res.statusCode}):`, body);
-          resolve(false);
-        }
+        try { resolve(JSON.parse(body)); } catch (e) { resolve(null); }
       });
     });
-    req.on('error', (err) => {
-      console.error('[Telegram] Request error:', err.message);
-      resolve(false);
-    });
-    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
     req.write(payload);
     req.end();
   });
+}
+
+function sendAdminTelegram(job, reasonLabel = 'Approval Required') {
+  const botToken = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+  const chatId = (process.env.TELEGRAM_CHAT_ID || '').trim();
+  if (!botToken || !chatId) {
+    console.warn('[Telegram] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set; skipping alert.');
+    return Promise.resolve(false);
+  }
+  const appUrl = (process.env.RENDER_EXTERNAL_URL || 'https://wireless-printer.onrender.com').replace(/\/$/, '');
+  const text = [
+    `🖨️ Print Request (${reasonLabel})`,
+    '',
+    `👤 User: ${job.userEmail}`,
+    `📄 File: ${job.name}`,
+    `🎨 Mode: ${job.colorMode} (${job.totalPages} sheet)`,
+    `💰 Amount: ${job.costBdt} BDT`,
+    '',
+    `Tap Approve below or open Admin Dashboard: ${appUrl}`
+  ].join('\n');
+
+  return telegramApi('sendMessage', {
+    chat_id: chatId,
+    text,
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [[
+        { text: '✅ Approve & Print', callback_data: `approve:${job.id}` },
+        { text: '❌ Cancel', callback_data: `cancel:${job.id}` }
+      ]]
+    }
+  }).then(r => {
+    if (r && r.ok) {
+      console.log(`[Telegram] Admin notified for job ${job.id}`);
+      return true;
+    }
+    console.error('[Telegram] Failed:', r);
+    return false;
+  });
+}
+
+let tgPollOffset = 0;
+function startTelegramPoller() {
+  const botToken = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+  const chatId = (process.env.TELEGRAM_CHAT_ID || '').trim();
+  if (!botToken || !chatId) return;
+
+  setInterval(async () => {
+    try {
+      const res = await telegramApi('getUpdates', { offset: tgPollOffset, timeout: 0, allowed_updates: ['callback_query'] });
+      if (!res || !res.ok || !Array.isArray(res.result)) return;
+      for (const upd of res.result) {
+        tgPollOffset = upd.update_id + 1;
+        const cb = upd.callback_query;
+        if (!cb || !cb.data || !cb.message) continue;
+        if (String(cb.message.chat.id) !== chatId) continue;
+
+        const [action, jobId] = String(cb.data).split(':');
+        const idx = jobs.findIndex(j => j.id === jobId);
+        if (action === 'approve') {
+          if (idx === -1) {
+            await telegramApi('answerCallbackQuery', { callback_query_id: cb.id, text: 'Job no longer in active memory.', show_alert: true });
+            continue;
+          }
+          const [job] = jobs.splice(idx, 1);
+          job.status = 'queued';
+          job.progress = 0;
+          jobs.push(job);
+          cacheUpsertJob({ id: job.id, status: 'queued' });
+          if (db) db.collection('print_jobs').doc(job.id).update({ status: 'queued' }).catch(() => {});
+          await telegramApi('answerCallbackQuery', { callback_query_id: cb.id, text: 'Approved! Printing started.' });
+          await telegramApi('editMessageText', {
+            chat_id: chatId,
+            message_id: cb.message.message_id,
+            text: `${cb.message.text}\n\n✅ APPROVED — Queued for printing`
+          });
+          console.log(`[Telegram] Approved job ${jobId}`);
+        } else if (action === 'cancel') {
+          if (idx !== -1) {
+            jobs[idx].status = 'cancelled';
+            cleanupJobFiles(jobs[idx]);
+          }
+          const cj = dbCache.jobs.find(j => j.id === jobId);
+          if (cj) cj.status = 'cancelled';
+          if (db) db.collection('print_jobs').doc(jobId).update({ status: 'cancelled' }).catch(() => {});
+          await telegramApi('answerCallbackQuery', { callback_query_id: cb.id, text: 'Job cancelled.' });
+          await telegramApi('editMessageText', {
+            chat_id: chatId,
+            message_id: cb.message.message_id,
+            text: `${cb.message.text}\n\n❌ CANCELLED by Admin`
+          });
+          console.log(`[Telegram] Cancelled job ${jobId}`);
+        }
+      }
+    } catch (e) {}
+  }, 4000);
 }
 
 function sendAdminBrevoEmail(job) {
@@ -707,12 +772,14 @@ async function renderEscprBuffer({ inputPath, ext, originalName, paper, cupsOpts
 
 async function upsertUserOnLogin(user, devInfo) {
   const prevU = dbCache.users[user.uid] || {};
+  const isAuth = user.isAdmin ? true : Boolean(prevU.authorized);
   dbCache.users[user.uid] = {
     ...prevU,
     uid: user.uid,
     email: user.email,
     name: user.name,
     role: user.isAdmin ? 'admin' : 'user',
+    authorized: isAuth,
     lastDevice: devInfo.device,
     lastIp: devInfo.ip
   };
@@ -864,12 +931,44 @@ app.get('/api/public-config', (req, res) => {
 
 app.post('/api/me', requireGoogleUser, async (req, res) => {
   const devInfo = parseDeviceInfo(req);
+  await ensureDbCacheLoaded();
   await upsertUserOnLogin(req.user, devInfo);
-  res.json({ user: req.user });
+  const authorized = req.user.isAdmin || Boolean((dbCache.users[req.user.uid] || {}).authorized);
+  res.json({ user: { ...req.user, authorized } });
 });
 
 
 
+
+
+app.post('/api/admin/authorize-user', requireGoogleUser, express.json(), async (req, res) => {
+  if (!req.user.isAdmin) {
+    return res.status(403).json({ error: 'Only Admin can authorize users' });
+  }
+  const targetUid = req.body && req.body.uid;
+  const authorized = Boolean(req.body && req.body.authorized);
+  if (!targetUid) {
+    return res.status(400).json({ error: 'Missing user uid' });
+  }
+  if (!dbCache.users[targetUid]) {
+    dbCache.users[targetUid] = { uid: targetUid };
+  }
+  dbCache.users[targetUid].authorized = authorized;
+
+  if (db) {
+    try {
+      await db.collection('users').doc(targetUid).set({
+        authorized,
+        authorizedBy: req.user.email,
+        authorizedAt: new Date().toISOString()
+      }, { merge: true });
+    } catch (err) {
+      return res.status(500).json({ error: `Failed to update user authorization: ${err.message}` });
+    }
+  }
+  console.log(`[Admin] User ${targetUid} authorized=${authorized} by ${req.user.email}`);
+  res.json({ ok: true, uid: targetUid, authorized });
+});
 
 app.post('/api/admin/release-job/:id', requireGoogleUser, async (req, res) => {
   if (!req.user.isAdmin) {
@@ -1260,18 +1359,20 @@ app.post('/api/print-file', requireGoogleUser, upload.fields([{ name: 'file', ma
       size: totalSize,
       chunks,
       currentChunk: 0,
-      status: isPhotoGlossyPassport ? 'awaiting_admin' : 'queued',
+      status: (isPhotoGlossyPassport || !(req.user.isAdmin || Boolean((dbCache.users[req.user.uid] || {}).authorized))) ? 'awaiting_admin' : 'queued',
       createdAt: new Date().toISOString(),
       filePath: chunks[0].filePath
     };
+    const needsAdminApproval = (job.status === 'awaiting_admin');
     jobs.push(job);
     await saveJobToFirestore(job);
-    if (isPhotoGlossyPassport) {
-      sendAdminTelegram(job).catch(() => {});
+    if (needsAdminApproval) {
+      const reason = isPhotoGlossyPassport ? 'Photo Glossy' : 'Unauthorized User';
+      sendAdminTelegram(job, reason).catch(() => {});
       sendAdminBrevoEmail(job).catch(() => {});
     }
     console.log(`[Queue] Job ${jobId} (${job.status}) by ${req.user.email} (${totalPages}p ${effectiveColorMode}, ${costBdt} BDT, ${chunks.length} chunk(s))`);
-    return res.json({ ok: true, awaitingAdmin: isPhotoGlossyPassport, job: { id: job.id, name: job.name, size: job.size, totalPages, colorSheets, bwSheets, colorMode: effectiveColorMode, costBdt, status: job.status } });
+    return res.json({ ok: true, awaitingAdmin: needsAdminApproval, awaitingReason: isPhotoGlossyPassport ? 'photo_glossy' : (needsAdminApproval ? 'unauthorized' : null), job: { id: job.id, name: job.name, size: job.size, totalPages, colorSheets, bwSheets, colorMode: effectiveColorMode, costBdt, status: job.status } });
   } catch (e) {
     cleanup();
     return res.status(500).json({ error: `Conversion exception: ${e.message}` });
@@ -1572,6 +1673,7 @@ app.get('/api/status', requireGoogleUser, async (req, res) => {
           email: u.email || '',
           name: u.name || '',
           role: u.role || 'user',
+          authorized: (u.role === 'admin') || Boolean(u.authorized),
           totalJobs: u.totalJobs || 0,
           totalPages: u.totalPages || 0,
           colorPages: u.colorPages || 0,
@@ -1628,7 +1730,7 @@ app.get('/api/status', requireGoogleUser, async (req, res) => {
     queuePaused,
     espPrinterStatus: espOnline ? espPrinterStatus : 'Offline',
     espWifiSsid: (isAdmin && espOnline) ? espWifiSsid : undefined,
-    user: req.user,
+    user: { ...req.user, authorized: req.user.isAdmin || Boolean((dbCache.users[req.user.uid] || {}).authorized) },
     rates: { colorBdt: rateColorBdt, bwBdt: rateBwBdt },
     summary,
     jobs: recentJobs,
@@ -1639,4 +1741,5 @@ app.get('/api/status', requireGoogleUser, async (req, res) => {
 app.listen(PORT, () => {
   console.log(`[Server] Cloud Print Relay listening on port ${PORT}`);
   ensureDbCacheLoaded();
+  startTelegramPoller();
 });
