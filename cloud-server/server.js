@@ -79,10 +79,63 @@ function startTelegramPoller() {
 
   setInterval(async () => {
     try {
-      const res = await telegramApi('getUpdates', { offset: tgPollOffset, timeout: 0, allowed_updates: ['callback_query'] });
+      const res = await telegramApi('getUpdates', { offset: tgPollOffset, timeout: 0, allowed_updates: ['callback_query', 'message'] });
       if (!res || !res.ok || !Array.isArray(res.result)) return;
       for (const upd of res.result) {
         tgPollOffset = upd.update_id + 1;
+
+        if (upd.message && upd.message.text && upd.message.chat && String(upd.message.chat.id) === chatId) {
+          const cmd = String(upd.message.text).trim().split(/\s+/)[0].toLowerCase().split('@')[0];
+          if (cmd === '/status' || cmd === '/start') {
+            const espOnline = (Date.now() - lastEspSeen) < 15000;
+            const printingJob = jobs.find(j => j.status === 'printing');
+            const queuedJobs = jobs.filter(j => j.status === 'queued');
+            const awaitingJobs = jobs.filter(j => j.status === 'awaiting_admin');
+            const queuedPages = queuedJobs.reduce((acc, j) => acc + Number(j.totalPages || 1), 0);
+            const reply = [
+              '🖨️ Printer Status',
+              '',
+              `• ESP32-S3: ${espOnline ? `🟢 Online (${espPrinterStatus})` : '🟡 Offline'}`,
+              `• Wi-Fi: ${espOnline && espWifiSsid ? espWifiSsid : '—'}`,
+              `• Queue: ${queuePaused ? '⏸️ PAUSED' : '▶️ ACTIVE'}`,
+              `• Printing Now: ${printingJob ? `${printingJob.name} (${printingJob.progress || 0}%)` : 'None'}`,
+              `• Queued: ${queuedJobs.length} job(s) (${queuedPages} page(s))`,
+              `• Awaiting Approval: ${awaitingJobs.length} job(s)`,
+              '',
+              'Commands: /status • /pause • /resume'
+            ].join('\n');
+            await telegramApi('sendMessage', { chat_id: chatId, text: reply });
+          } else if (cmd === '/pause') {
+            queuePaused = true;
+            if (db) {
+              db.collection('settings').doc('queue').set({
+                paused: true, updatedBy: 'telegram', updatedAt: new Date().toISOString()
+              }, { merge: true }).catch(() => {});
+            }
+            await telegramApi('sendMessage', {
+              chat_id: chatId,
+              text: '⏸️ Print queue PAUSED. Users can still upload; send /resume when ready.'
+            });
+          } else if (cmd === '/resume') {
+            queuePaused = false;
+            if (db) {
+              db.collection('settings').doc('queue').set({
+                paused: false, updatedBy: 'telegram', updatedAt: new Date().toISOString()
+              }, { merge: true }).catch(() => {});
+            }
+            await telegramApi('sendMessage', {
+              chat_id: chatId,
+              text: '▶️ Print queue RESUMED! Queued jobs will start printing now.'
+            });
+          } else if (cmd === '/help') {
+            await telegramApi('sendMessage', {
+              chat_id: chatId,
+              text: 'Available commands:\n/status — Printer, Wi-Fi & queue info\n/pause — Pause print queue\n/resume — Resume print queue'
+            });
+          }
+          continue;
+        }
+
         const cb = upd.callback_query;
         if (!cb || !cb.data || !cb.message) continue;
         if (String(cb.message.chat.id) !== chatId) continue;
