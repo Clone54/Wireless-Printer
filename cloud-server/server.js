@@ -1,6 +1,128 @@
 const express = require('express');
 const multer = require('multer');
 const fs = require('fs');
+const https = require('https');
+
+
+function sendAdminTelegram(job) {
+  const botToken = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+  const chatId = (process.env.TELEGRAM_CHAT_ID || '').trim();
+  if (!botToken || !chatId) {
+    console.warn('[Telegram] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not set; skipping alert.');
+    return Promise.resolve(false);
+  }
+  const appUrl = (process.env.RENDER_EXTERNAL_URL || 'https://wireless-printer.onrender.com').replace(/\/$/, '');
+  const text = [
+    '📸 New Photo Glossy Print Request',
+    '',
+    `👤 User: ${job.userEmail}`,
+    `📄 File: ${job.name}`,
+    `🖨️ Mode: ${job.colorMode} (${job.totalPages} sheet)`,
+    `💰 Amount: ${job.costBdt} BDT`,
+    '',
+    'Load Photo Glossy paper, then tap Start Print:',
+    appUrl
+  ].join('\n');
+
+  const payload = JSON.stringify({
+    chat_id: chatId,
+    text,
+    disable_web_page_preview: true
+  });
+
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: 'api.telegram.org',
+      path: `/bot${botToken}/sendMessage`,
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(payload)
+      },
+      timeout: 8000
+    }, (res) => {
+      let body = '';
+      res.on('data', d => body += d);
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          console.log(`[Telegram] Admin notified for job ${job.id}`);
+          resolve(true);
+        } else {
+          console.error(`[Telegram] Failed (${res.statusCode}):`, body);
+          resolve(false);
+        }
+      });
+    });
+    req.on('error', (err) => {
+      console.error('[Telegram] Request error:', err.message);
+      resolve(false);
+    });
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.write(payload);
+    req.end();
+  });
+}
+
+function sendAdminBrevoEmail(job) {
+  const apiKey = (process.env.BREVO_API_KEY || '').trim();
+  if (!apiKey) {
+    console.warn('[Brevo] BREVO_API_KEY not set; skipping admin email notification.');
+    return Promise.resolve(false);
+  }
+  const senderEmail = (process.env.BREVO_SENDER_EMAIL || ADMIN_EMAIL).trim();
+  const appUrl = (process.env.RENDER_EXTERNAL_URL || 'https://wireless-printer.onrender.com').replace(/\/$/, '');
+  const payload = JSON.stringify({
+    sender: { name: 'Firoz Cloud Print', email: senderEmail },
+    to: [{ email: ADMIN_EMAIL, name: 'Admin' }],
+    subject: `[Photo Glossy Request] ${job.name} (${job.costBdt} BDT)`,
+    htmlContent: `
+      <div style="font-family:system-ui,sans-serif;max-width:520px;padding:16px;border:1px solid #e2e8f0;border-radius:10px;">
+        <h2 style="margin:0 0 10px;color:#0f172a;">New Photo Glossy Print Request</h2>
+        <p style="margin:6px 0;"><b>User:</b> ${job.userEmail}</p>
+        <p style="margin:6px 0;"><b>Document:</b> ${job.name}</p>
+        <p style="margin:6px 0;"><b>Mode:</b> ${job.colorMode} (${job.totalPages} sheet)</p>
+        <p style="margin:6px 0;"><b>Amount:</b> ${job.costBdt} BDT</p>
+        <p style="margin:14px 0 0;">Load Photo Glossy paper into the Epson L3210, then click <b>Start Print</b> on your Admin dashboard:</p>
+        <p style="margin:12px 0 0;"><a href="${appUrl}" style="display:inline-block;padding:10px 16px;background:#2563eb;color:#fff;text-decoration:none;border-radius:8px;font-weight:600;">Open Admin Dashboard</a></p>
+      </div>
+    `
+  });
+
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: 'api.brevo.com',
+      path: '/v3/smtp/email',
+      method: 'POST',
+      headers: {
+        'accept': 'application/json',
+        'content-type': 'application/json',
+        'api-key': apiKey,
+        'content-length': Buffer.byteLength(payload)
+      },
+      timeout: 8000
+    }, (res) => {
+      let body = '';
+      res.on('data', d => body += d);
+      res.on('end', () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          console.log(`[Brevo] Admin notified for job ${job.id}`);
+          resolve(true);
+        } else {
+          console.error(`[Brevo] Failed (${res.statusCode}):`, body);
+          resolve(false);
+        }
+      });
+    });
+    req.on('error', (err) => {
+      console.error('[Brevo] Request error:', err.message);
+      resolve(false);
+    });
+    req.on('timeout', () => { req.destroy(); resolve(false); });
+    req.write(payload);
+    req.end();
+  });
+}
+
 const path = require('path');
 const crypto = require('crypto');
 const { spawn } = require('child_process');
@@ -735,6 +857,28 @@ app.post('/api/me', requireGoogleUser, async (req, res) => {
 
 
 
+
+app.post('/api/admin/release-job/:id', requireGoogleUser, async (req, res) => {
+  if (!req.user.isAdmin) {
+    return res.status(403).json({ error: 'Only Admin can start Photo Glossy jobs' });
+  }
+  const jobId = req.params.id;
+  const idx = jobs.findIndex(j => j.id === jobId);
+  if (idx === -1) {
+    return res.status(404).json({ error: 'Job files are no longer in active memory (server may have restarted). Ask user to re-upload.' });
+  }
+  const [job] = jobs.splice(idx, 1);
+  job.status = 'queued';
+  job.progress = 0;
+  jobs.push(job);
+  cacheUpsertJob({ id: job.id, status: 'queued' });
+  if (db) {
+    db.collection('print_jobs').doc(job.id).update({ status: 'queued' }).catch(() => {});
+  }
+  console.log(`[Admin] Released Photo Glossy job ${job.id} into live queue by ${req.user.email}`);
+  res.json({ ok: true });
+});
+
 app.post('/api/admin/queue-toggle', requireGoogleUser, express.json(), async (req, res) => {
   if (!req.user.isAdmin) {
     return res.status(403).json({ error: 'Only Admin can pause or resume the queue' });
@@ -1103,14 +1247,18 @@ app.post('/api/print-file', requireGoogleUser, upload.fields([{ name: 'file', ma
       size: totalSize,
       chunks,
       currentChunk: 0,
-      status: 'queued',
+      status: isPhotoGlossyPassport ? 'awaiting_admin' : 'queued',
       createdAt: new Date().toISOString(),
       filePath: chunks[0].filePath
     };
     jobs.push(job);
     await saveJobToFirestore(job);
-    console.log(`[Queue] Job ${jobId} by ${req.user.email} (${totalPages}p ${colorMode}, ${costBdt} BDT, ${chunks.length} chunk(s))`);
-    return res.json({ ok: true, job: { id: job.id, name: job.name, size: job.size, totalPages, colorSheets, bwSheets, colorMode: effectiveColorMode, costBdt, status: job.status } });
+    if (isPhotoGlossyPassport) {
+      sendAdminTelegram(job).catch(() => {});
+      sendAdminBrevoEmail(job).catch(() => {});
+    }
+    console.log(`[Queue] Job ${jobId} (${job.status}) by ${req.user.email} (${totalPages}p ${effectiveColorMode}, ${costBdt} BDT, ${chunks.length} chunk(s))`);
+    return res.json({ ok: true, awaitingAdmin: isPhotoGlossyPassport, job: { id: job.id, name: job.name, size: job.size, totalPages, colorSheets, bwSheets, colorMode: effectiveColorMode, costBdt, status: job.status } });
   } catch (e) {
     cleanup();
     return res.status(500).json({ error: `Conversion exception: ${e.message}` });

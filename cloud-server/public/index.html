@@ -704,6 +704,20 @@
       await firebase.auth().signOut();
     }
 
+    async function releaseJob(jobId) {
+      if (!currentUser || !isAdmin) return;
+      try {
+        const idToken = await currentUser.getIdToken();
+        const res = await fetch(`/api/admin/release-job/${jobId}`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${idToken}` }
+        });
+        const data = await res.json();
+        if (!res.ok) alert(data.error || 'Could not start job.');
+        refreshStatus();
+      } catch (e) {}
+    }
+
     async function cancelJob(jobId) {
       if (!currentUser) return;
       try {
@@ -861,6 +875,10 @@
         : `${orderLabel} • ${nUp}/sheet`;
 
       const count = selectedCount !== null ? selectedCount : getSelectedPageNumbers(totalLoadedPages).length;
+      const sendBtn = document.getElementById('sendBtn');
+      const isPhotoGlossyBtn = (preset === 'passport' && document.getElementById('passportMedia').value === 'PMPHOTO_NORMAL');
+      if (sendBtn) sendBtn.textContent = isPhotoGlossyBtn ? 'Send to Admin' : 'Send to Printer';
+
       if (count <= 0) {
         document.getElementById('estText').textContent = totalLoadedPages > 0 ? '0 pages match filter' : 'Select a file to see sheet count';
         document.getElementById('estCost').textContent = '0 BDT';
@@ -1266,7 +1284,10 @@
             } else if (j.status === 'printing' && jobWaitHistory[j.id] && jobWaitHistory[j.id].hadWait) {
               waitNote = `<div style="font-size:11px;color:#4ade80;margin-top:3px;">Done, your job started!</div>`;
             }
-            const cancelBtn = (j.status === 'queued' || j.status === 'printing')
+            const releaseBtn = (isAdmin && j.status === 'awaiting_admin')
+              ? ` <button class="btn-ghost" style="padding:2px 8px;font-size:11px;margin-left:4px;border-color:#22c55e;color:#4ade80;" onclick="releaseJob('${j.id}')">Start Print</button>`
+              : '';
+            const cancelBtn = (j.status === 'queued' || j.status === 'printing' || j.status === 'awaiting_admin')
               ? ` <button class="btn-ghost" style="padding:2px 7px;font-size:11px;margin-left:4px;" onclick="cancelJob('${j.id}')">Cancel</button>`
               : '';
             if (isAdmin) {
@@ -1277,7 +1298,7 @@
                 <td><span class="pill ${isColor ? 'pill-color' : 'pill-bw'}">${j.colorMode || 'Color'}</span></td>
                 <td>${j.totalPages || 1}</td>
                 <td style="color:#fbbf24;font-weight:600;">${costStr}</td>
-                <td><span class="pill pill-status">${statusText}</span>${cancelBtn}${waitNote}</td>
+                <td><span class="pill pill-status">${statusText}</span>${releaseBtn}${cancelBtn}${waitNote}</td>
                 <td style="color:#94a3b8;font-size:12px;">${timeStr}</td>
               </tr>`;
             }
@@ -1286,7 +1307,7 @@
               <td><span class="pill ${isColor ? 'pill-color' : 'pill-bw'}">${j.colorMode || 'Color'}</span></td>
               <td>${j.totalPages || 1}</td>
               <td style="color:#fbbf24;font-weight:600;">${costStr}</td>
-              <td><span class="pill pill-status">${statusText}</span>${cancelBtn}${waitNote}</td>
+              <td><span class="pill pill-status">${statusText}</span>${releaseBtn}${cancelBtn}${waitNote}</td>
               <td style="color:#94a3b8;font-size:12px;">${timeStr}</td>
             </tr>`;
           }).join('');
@@ -1343,7 +1364,9 @@
         const data = await res.json();
         if (res.ok) {
           msg.className = 'msg-ok';
-          msg.textContent = `Queued "${data.job.name}" (${data.job.totalPages} sheet(s) ${data.job.colorMode} = ${data.job.costBdt} BDT). Printing shortly.`;
+          msg.textContent = data.awaitingAdmin
+            ? `Sent "${data.job.name}" (${data.job.costBdt} BDT) to Admin. You'll see it start once Admin loads Photo Glossy paper.`
+            : `Queued "${data.job.name}" (${data.job.totalPages} sheet(s) ${data.job.colorMode} = ${data.job.costBdt} BDT). Printing shortly.`;
           refreshStatus();
         } else {
           msg.className = 'msg-err';
