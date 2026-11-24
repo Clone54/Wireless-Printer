@@ -43,7 +43,8 @@ function sendAdminTelegram(job, reasonLabel = 'Approval Required') {
   const text = [
     `🖨️ Print Request (${reasonLabel})`,
     '',
-    `👤 User: ${job.userName ? `${job.userName} \n (${job.userEmail})` : job.userEmail}`,`,
+    `👤 Name: ${job.userName || '—'}`,
+    `📧 Email: ${job.userEmail}`,
     `📄 File: ${job.name}`,
     `🎨 Mode: ${job.colorMode} (${job.totalPages} sheet)`,
     `💰 Amount: ${job.costBdt} BDT`,
@@ -121,7 +122,7 @@ function sendTelegramFailAlert(job) {
   if (!botToken || !chatId) return;
   telegramApi('sendMessage', {
     chat_id: chatId,
-    text: `❌ Print Failed: "${job.name}"\n👤 User: ${job.userName ? `${job.userName}\n(${job.userEmail}) : job.userEmail}`, || '—'}\n💰 Cost: ${job.costBdt || 0} BDT`
+    text: `❌ Print Failed: "${job.name}"\n👤 Name: ${job.userName || '—'}\n📧 Email: ${job.userEmail || '—'}\n💰 Cost: ${job.costBdt || 0} BDT`
   }).catch(() => {});
 }
 
