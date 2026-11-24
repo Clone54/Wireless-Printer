@@ -28,6 +28,9 @@ RUN npm install --omit=dev
 COPY . .
 RUN chmod +x /app/entrypoint.sh
 
+# Allow ImageMagick PDF write and CUPS FileDevice
+RUN sed -i 's/rights="none" pattern="PDF"/rights="read|write" pattern="PDF"/g' /etc/ImageMagick-6/policy.xml || true
+
 # Allow CUPS FileDevice so lpadmin can materialize the Epson PPD
 RUN echo "FileDevice Yes" >> /etc/cups/cups-files.conf
 

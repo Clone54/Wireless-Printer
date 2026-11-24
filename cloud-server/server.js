@@ -591,9 +591,15 @@ async function composePresetPdf({ inputPath, ext, backPath, preset, passportCopi
         const y = Math.round((pgH - cardH) / 2);
         args.push(fCard, '-geometry', `+${x}+${y}`, '-composite');
       }
-      args.push('-density', '300', '-units', 'PixelsPerInch', outPdfPath);
-      const res = await runFilter('convert', args, null);
-      return fs.existsSync(outPdfPath) && res.code === 0;
+      const pdfArgs = [...args, '-density', '300', '-units', 'PixelsPerInch', outPdfPath];
+      const res = await runFilter('convert', pdfArgs, null);
+      if (fs.existsSync(outPdfPath) && res.code === 0) return outPdfPath;
+      console.error('[Preset] ID card PDF failed:', res.stderr);
+      const outPng = outPdfPath.replace(/\.pdf$/i, '.png');
+      const pngRes = await runFilter('convert', [...args, '-density', '300', '-units', 'PixelsPerInch', outPng], null);
+      if (fs.existsSync(outPng) && pngRes.code === 0) return outPng;
+      console.error('[Preset] ID card PNG failed:', pngRes.stderr);
+      return null;
     }
 
     if (preset === 'passport' || preset === 'passport_4' || preset === 'passport_8') {
@@ -635,7 +641,14 @@ async function composePresetPdf({ inputPath, ext, backPath, preset, passportCopi
       }
 
       const res = await runFilter('convert', [...sheetPngs, '-density', '300', '-units', 'PixelsPerInch', outPdfPath], null);
-      return fs.existsSync(outPdfPath) && res.code === 0;
+      if (fs.existsSync(outPdfPath) && res.code === 0) return outPdfPath;
+      console.error('[Preset] Passport PDF failed:', res.stderr);
+      if (sheetPngs.length === 1) {
+        const outPng = outPdfPath.replace(/\.pdf$/i, '.png');
+        fs.copyFileSync(sheetPngs[0], outPng);
+        return outPng;
+      }
+      return null;
     }
     return false;
   } finally {
@@ -1046,16 +1059,16 @@ app.post('/api/print-file', requireGoogleUser, upload.fields([{ name: 'file', ma
   if (layoutPreset !== 'none') {
     const composedPdf = path.join(JOBS_DIR, `${jobId}_preset.pdf`);
     extraCleanup.push(composedPdf);
-    const composedOk = await composePresetPdf({
+    const composedPath = await composePresetPdf({
       inputPath, ext, backPath, preset: layoutPreset, passportCopies, paper, orientation, outPdfPath: composedPdf
     });
-    if (!composedOk) {
+    if (!composedPath) {
       cleanup();
       return res.status(500).json({ error: 'Failed to compose ID Card / Passport Photo sheet.' });
     }
     extraCleanup.push(inputPath);
-    inputPath = composedPdf;
-    ext = '.pdf';
+    inputPath = composedPath;
+    ext = path.extname(composedPath).toLowerCase() || '.pdf';
     activePageMode = 'all';
     activeCustomPages = '';
     activePagesPerSheet = 1;
