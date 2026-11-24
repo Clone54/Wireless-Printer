@@ -198,9 +198,9 @@
     <h1>Firoz Cloud Print</h1>
     <p id="loginHint">Print Documents wirelessly from any network in 4 simple steps.</p>
     <div class="rate-banner">
-      <span>Color: <b>4 BDT / page</b></span>
+      <span>Color: <b id="loginRateColor">4 BDT / page</b></span>
       <span>•</span>
-      <span>B&amp;W: <b>3 BDT / page</b></span>
+      <span>B&amp;W: <b id="loginRateBw">3 BDT / page</b></span>
     </div>
 
     <div class="workflow-stage">
@@ -264,11 +264,11 @@
         <div class="stat-val" id="statTotalPages">0</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">Color Pages (4 BDT)</div>
+        <div class="stat-label" id="lblColorRate">Color Pages (4 BDT)</div>
         <div class="stat-val" style="color:#60a5fa" id="statColorPages">0</div>
       </div>
       <div class="stat-card">
-        <div class="stat-label">B&amp;W Pages (3 BDT)</div>
+        <div class="stat-label" id="lblBwRate">B&amp;W Pages (3 BDT)</div>
         <div class="stat-val" style="color:#cbd5e1" id="statBwPages">0</div>
       </div>
       <div class="stat-card">
@@ -278,7 +278,7 @@
       <div class="stat-card due-highlight">
         <div class="stat-label" id="lblDueAmount">Your Due Amount</div>
         <div class="stat-val" style="color:#fbbf24" id="statDueAmount">0 BDT</div>
-        <div class="stat-note">Color: 4 BDT • B&amp;W: 3 BDT</div>
+        <div class="stat-note" id="lblRateNote">Color: 4 BDT • B&amp;W: 3 BDT</div>
       </div>
     </div>
 
@@ -327,8 +327,8 @@
           <div>
             <label for="color">Color Mode</label>
             <select id="color" onchange="renderPreview()">
-              <option value="RGB">Color (4 BDT/p)</option>
-              <option value="Gray">Black&amp;White (3 BDT/p)</option>
+              <option value="RGB" id="optColorRate">Color (4 BDT/p)</option>
+              <option value="Gray" id="optBwRate">Black&amp;White (3 BDT/p)</option>
             </select>
           </div>
           <div>
@@ -390,6 +390,25 @@
       </div>
     </div>
 
+    <!-- Admin-Only: Pricing Rate Controls -->
+    <div id="adminRatesCard" class="card hidden">
+      <div class="section-title">Admin View: Pricing Rates (BDT / Page)</div>
+      <div class="row-3" style="align-items:end;">
+        <div>
+          <label for="rateColorInput" style="margin-top:0;">Color Rate (BDT)</label>
+          <input id="rateColorInput" type="number" min="0" max="500" step="0.5" value="4" />
+        </div>
+        <div>
+          <label for="rateBwInput" style="margin-top:0;">B&amp;W Rate (BDT)</label>
+          <input id="rateBwInput" type="number" min="0" max="500" step="0.5" value="3" />
+        </div>
+        <div>
+          <button class="btn-primary" style="margin-top:0;padding:10px 12px;" onclick="saveRates()">Save Rates</button>
+        </div>
+      </div>
+      <div id="rateMsg" style="margin-top:8px;font-size:12px;"></div>
+    </div>
+
     <!-- Admin-Only: All Users Breakdown -->
     <div id="adminUsersCard" class="card hidden" style="overflow-x:auto;">
       <div class="section-title">Admin View: All Users &amp; Devices</div>
@@ -437,6 +456,8 @@
     let wfStepIndex = 0;
     let renderToken = 0;
     let resizeTimer = null;
+    let rateColorBdt = 4;
+    let rateBwBdt = 3;
     const jobWaitHistory = {};
 
     setInterval(() => {
@@ -455,12 +476,78 @@
       resizeTimer = setTimeout(() => renderPreview(), 150);
     });
 
+    function applyRates(rates) {
+      if (!rates) return;
+      if (typeof rates.colorBdt === 'number') rateColorBdt = rates.colorBdt;
+      if (typeof rates.bwBdt === 'number') rateBwBdt = rates.bwBdt;
+
+      const lrc = document.getElementById('loginRateColor');
+      const lrb = document.getElementById('loginRateBw');
+      if (lrc) lrc.textContent = `${rateColorBdt} BDT / page`;
+      if (lrb) lrb.textContent = `${rateBwBdt} BDT / page`;
+
+      const lblC = document.getElementById('lblColorRate');
+      const lblB = document.getElementById('lblBwRate');
+      const lblN = document.getElementById('lblRateNote');
+      if (lblC) lblC.textContent = `Color Pages (${rateColorBdt} BDT)`;
+      if (lblB) lblB.textContent = `B&W Pages (${rateBwBdt} BDT)`;
+      if (lblN) lblN.textContent = `Color: ${rateColorBdt} BDT • B&W: ${rateBwBdt} BDT`;
+
+      const optC = document.getElementById('optColorRate');
+      const optB = document.getElementById('optBwRate');
+      if (optC) optC.textContent = `Color (${rateColorBdt} BDT/p)`;
+      if (optB) optB.textContent = `Black&White (${rateBwBdt} BDT/p)`;
+
+      const inC = document.getElementById('rateColorInput');
+      const inB = document.getElementById('rateBwInput');
+      if (inC && document.activeElement !== inC) inC.value = rateColorBdt;
+      if (inB && document.activeElement !== inB) inB.value = rateBwBdt;
+
+      updateEstimate();
+    }
+
+    async function saveRates() {
+      if (!currentUser || !isAdmin) return;
+      const msg = document.getElementById('rateMsg');
+      const colorBdt = parseFloat(document.getElementById('rateColorInput').value);
+      const bwBdt = parseFloat(document.getElementById('rateBwInput').value);
+      if (isNaN(colorBdt) || isNaN(bwBdt) || colorBdt < 0 || bwBdt < 0) {
+        msg.className = 'msg-err';
+        msg.textContent = 'Enter valid non-negative rates.';
+        return;
+      }
+      msg.className = 'msg-info';
+      msg.textContent = 'Saving rates...';
+      try {
+        const idToken = await currentUser.getIdToken();
+        const res = await fetch('/api/admin/rates', {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${idToken}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ colorBdt, bwBdt })
+        });
+        const data = await res.json();
+        if (res.ok) {
+          applyRates(data.rates);
+          msg.className = 'msg-ok';
+          msg.textContent = `Saved: Color ${data.rates.colorBdt} BDT/p, B&W ${data.rates.bwBdt} BDT/p`;
+          refreshStatus();
+        } else {
+          msg.className = 'msg-err';
+          msg.textContent = data.error || 'Failed to save rates.';
+        }
+      } catch (e) {
+        msg.className = 'msg-err';
+        msg.textContent = 'Network error saving rates.';
+      }
+    }
+
     async function initApp() {
       const errEl = document.getElementById('loginErr');
       const btn = document.getElementById('googleBtn');
       try {
         const res = await fetch('/api/public-config');
         const cfg = await res.json();
+        if (cfg.rates) applyRates(cfg.rates);
         if (!cfg.firebaseConfig) {
           errEl.textContent = 'Server missing FIREBASE_WEB_CONFIG_JSON environment variable.';
           return;
@@ -563,6 +650,7 @@
       document.getElementById('userSub').textContent = `${user.email}`;
       document.getElementById('roleBadge').classList.toggle('hidden', !isAdmin);
       document.getElementById('adminUsersCard').classList.toggle('hidden', !isAdmin);
+      document.getElementById('adminRatesCard').classList.toggle('hidden', !isAdmin);
       document.getElementById('lblTotalPages').textContent = isAdmin ? 'All Users Pages' : 'Your Total Pages';
       document.getElementById('lblTotalJobs').textContent = isAdmin ? 'All Print Jobs' : 'Your Print Jobs';
       document.getElementById('lblDueAmount').textContent = isAdmin ? 'Total Unpaid Dues' : 'Your Due Amount';
@@ -687,7 +775,7 @@
       const copies = Math.max(1, Math.min(20, parseInt(document.getElementById('copies').value || '1', 10) || 1));
       const sheets = Math.ceil(count / nUp) * copies;
       const isColor = document.getElementById('color').value !== 'Gray';
-      const cost = sheets * (isColor ? 4 : 3);
+      const cost = Math.round(sheets * (isColor ? rateColorBdt : rateBwBdt) * 100) / 100;
       document.getElementById('estText').textContent = `${count} page(s) → ${sheets} physical sheet(s)`;
       document.getElementById('estCost').textContent = `${cost} BDT`;
     }
@@ -826,6 +914,7 @@
         const res = await fetch('/api/status', { headers: { 'Authorization': `Bearer ${idToken}` } });
         if (res.status === 401) return;
         const data = await res.json();
+        if (data.rates) applyRates(data.rates);
 
         const badge = document.getElementById('espBadge');
         const wifiTag = (isAdmin && data.espOnline && data.espWifiSsid) ? ` • WiFi: ${data.espWifiSsid}` : '';
@@ -867,7 +956,7 @@
           tbody.innerHTML = data.jobs.map(j => {
             const isColor = j.colorMode !== 'B&W';
             const timeStr = j.createdAt ? new Date(j.createdAt).toLocaleString() : '—';
-            const costStr = `${j.costBdt || ((j.totalPages || 1) * (isColor ? 4 : 3))} BDT`;
+            const costStr = `${typeof j.costBdt === "number" ? j.costBdt : ((j.totalPages || 1) * (isColor ? rateColorBdt : rateBwBdt))} BDT`;
             if (j.status === 'queued' && j.waitingPages > 0) {
               jobWaitHistory[j.id] = { hadWait: true, startedAt: 0 };
             } else if (jobWaitHistory[j.id] && jobWaitHistory[j.id].hadWait && j.status === 'printing' && !jobWaitHistory[j.id].startedAt) {

@@ -11,8 +11,8 @@ app.set('trust proxy', true);
 const PORT = process.env.PORT || 3000;
 const PRINT_TOKEN = process.env.PRINT_TOKEN || 'changeme123';
 const ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'firozahmedshoykot44@gmail.com').toLowerCase();
-const RATE_COLOR_BDT = 4;
-const RATE_BW_BDT = 3;
+let rateColorBdt = 4;
+let rateBwBdt = 3;
 const PPD_PATH = '/etc/cups/ppd/epson_l3210.ppd';
 const JOBS_DIR = '/tmp/jobs';
 const UPLOADS_DIR = '/tmp/uploads';
@@ -60,6 +60,7 @@ const memoryUserDues = {};
 const dbCache = {
   loaded: false,
   lastAttemptMs: 0,
+  rates: { colorBdt: 4, bwBdt: 3 },
   summary: { totalJobs: 0, totalPages: 0, colorPages: 0, bwPages: 0 },
   users: {},
   jobs: []
@@ -80,11 +81,18 @@ async function ensureDbCacheLoaded() {
   if (Date.now() - dbCache.lastAttemptMs < 300000) return;
   dbCache.lastAttemptMs = Date.now();
   try {
-    const [sumDoc, jobsSnap, usersSnap] = await Promise.all([
+    const [sumDoc, jobsSnap, usersSnap, rateDoc] = await Promise.all([
       db.collection('stats').doc('summary').get(),
       db.collection('print_jobs').orderBy('timestamp', 'desc').limit(100).get(),
-      db.collection('users').get()
+      db.collection('users').get(),
+      db.collection('settings').doc('pricing').get()
     ]);
+    if (rateDoc.exists) {
+      const rd = rateDoc.data();
+      if (typeof rd.colorBdt === 'number' && rd.colorBdt >= 0) rateColorBdt = rd.colorBdt;
+      if (typeof rd.bwBdt === 'number' && rd.bwBdt >= 0) rateBwBdt = rd.bwBdt;
+      dbCache.rates = { colorBdt: rateColorBdt, bwBdt: rateBwBdt };
+    }
 
     if (sumDoc.exists) {
       const d = sumDoc.data();
@@ -151,7 +159,7 @@ let espPrinterStatus = 'Unknown';
 let espWifiSsid = '';
 
 function computeDueBdt(colorPages, bwPages) {
-  return (Number(colorPages || 0) * RATE_COLOR_BDT) + (Number(bwPages || 0) * RATE_BW_BDT);
+  return (Number(colorPages || 0) * rateColorBdt) + (Number(bwPages || 0) * rateBwBdt);
 }
 
 function decodeFilename(name) {
@@ -523,7 +531,7 @@ app.get('/api/public-config', (req, res) => {
     firebaseConfig: webConfig,
     googleClientId: process.env.GOOGLE_CLIENT_ID || '',
     firestoreEnabled: Boolean(db),
-    rates: { colorBdt: RATE_COLOR_BDT, bwBdt: RATE_BW_BDT }
+    rates: { colorBdt: rateColorBdt, bwBdt: rateBwBdt }
   });
 });
 
@@ -531,6 +539,36 @@ app.post('/api/me', requireGoogleUser, async (req, res) => {
   const devInfo = parseDeviceInfo(req);
   await upsertUserOnLogin(req.user, devInfo);
   res.json({ user: req.user });
+});
+
+
+app.post('/api/admin/rates', requireGoogleUser, express.json(), async (req, res) => {
+  if (!req.user.isAdmin) {
+    return res.status(403).json({ error: 'Only Admin can change pricing rates' });
+  }
+  const c = Number(req.body && req.body.colorBdt);
+  const b = Number(req.body && req.body.bwBdt);
+  if (!Number.isFinite(c) || !Number.isFinite(b) || c < 0 || b < 0 || c > 500 || b > 500) {
+    return res.status(400).json({ error: 'Invalid rates. Enter values between 0 and 500 BDT.' });
+  }
+  rateColorBdt = Math.round(c * 100) / 100;
+  rateBwBdt = Math.round(b * 100) / 100;
+  dbCache.rates = { colorBdt: rateColorBdt, bwBdt: rateBwBdt };
+
+  if (db) {
+    try {
+      await db.collection('settings').doc('pricing').set({
+        colorBdt: rateColorBdt,
+        bwBdt: rateBwBdt,
+        updatedBy: req.user.email,
+        updatedAt: new Date().toISOString()
+      }, { merge: true });
+    } catch (err) {
+      return res.status(500).json({ error: `Failed to save rates in Firestore: ${err.message}` });
+    }
+  }
+  console.log(`[Admin] Updated rates: Color=${rateColorBdt} BDT, B&W=${rateBwBdt} BDT by ${req.user.email}`);
+  res.json({ ok: true, rates: { colorBdt: rateColorBdt, bwBdt: rateBwBdt } });
 });
 
 app.post('/api/admin/reset-due', requireGoogleUser, express.json(), async (req, res) => {
@@ -614,7 +652,7 @@ app.post('/api/print-file', requireGoogleUser, upload.single('file'), async (req
   }
   const sheetsPerCopy = Math.ceil(selectedPages / pagesPerSheet);
   const totalPages = sheetsPerCopy * copies;
-  const costBdt = colorMode === 'Color' ? (totalPages * RATE_COLOR_BDT) : (totalPages * RATE_BW_BDT);
+  const costBdt = colorMode === 'Color' ? (totalPages * rateColorBdt) : (totalPages * rateBwBdt);
   const devInfo = parseDeviceInfo(req);
 
   const baseCupsOpts = [
@@ -783,7 +821,7 @@ app.post('/api/print-raw', requireDeviceToken, express.raw({ type: '*/*', limit:
     pagesPerSheet: 1,
     copies: 1,
     totalPages: 1,
-    costBdt: RATE_COLOR_BDT,
+    costBdt: rateColorBdt,
     paper: 'A4',
     orientation: 'portrait',
     quality: 'Driver',
@@ -1105,7 +1143,7 @@ app.get('/api/status', requireGoogleUser, async (req, res) => {
     espPrinterStatus: espOnline ? espPrinterStatus : 'Offline',
     espWifiSsid: (isAdmin && espOnline) ? espWifiSsid : undefined,
     user: req.user,
-    rates: { colorBdt: RATE_COLOR_BDT, bwBdt: RATE_BW_BDT },
+    rates: { colorBdt: rateColorBdt, bwBdt: rateBwBdt },
     summary,
     jobs: recentJobs,
     allUsers: isAdmin ? allUsers : []
