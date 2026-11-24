@@ -372,6 +372,24 @@ async function countSelectedPages(filePath, ext, pageMode, customPages) {
 const PSRAM_CHUNK_THRESHOLD = 6500000; // 6.5 MB threshold (fits safely inside 7 MB ESP32-S3 PSRAM buffer)
 
 
+
+const OFFICE_EXTS = new Set(['.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx', '.odt', '.ods', '.odp', '.txt', '.rtf']);
+
+async function convertOfficeToPdf(inputPath, outDir) {
+  const baseName = path.basename(inputPath, path.extname(inputPath));
+  const outPdf = path.join(outDir, `${baseName}.pdf`);
+  const res = await runFilter('libreoffice', [
+    '--headless', '--norestore', '--nofirststartwizard',
+    '-env:UserInstallation=file:///tmp/lo_profile',
+    '--convert-to', 'pdf',
+    '--outdir', outDir,
+    inputPath
+  ], null);
+  if (fs.existsSync(outPdf)) return outPdf;
+  console.error('[LibreOffice] Conversion failed:', res.stderr);
+  return null;
+}
+
 async function composePresetPdf({ inputPath, ext, backPath, preset, paper, orientation, outPdfPath }) {
   // 300 DPI page dimensions
   const dims300 = {
@@ -623,7 +641,7 @@ async function updateJobStatusInFirestore(job, ok) {
   if (ok) {
     const colorInc = typeof job.colorSheets === 'number' ? job.colorSheets : (job.colorMode === 'Color' ? job.totalPages : 0);
     const bwInc = typeof job.bwSheets === 'number' ? job.bwSheets : (job.colorMode === 'B&W' ? job.totalPages : 0);
-    const costInc = computeDueBdt(colorInc, bwInc);
+    const costInc = typeof job.costBdt === 'number' ? job.costBdt : computeDueBdt(colorInc, bwInc);
     dbCache.summary.totalJobs = (dbCache.summary.totalJobs || 0) + 1;
     dbCache.summary.totalPages = (dbCache.summary.totalPages || 0) + job.totalPages;
     dbCache.summary.colorPages = (dbCache.summary.colorPages || 0) + colorInc;
@@ -657,7 +675,7 @@ async function updateJobStatusInFirestore(job, ok) {
       const inc = admin.firestore.FieldValue.increment;
       const colorInc = typeof job.colorSheets === 'number' ? job.colorSheets : (job.colorMode === 'Color' ? job.totalPages : 0);
       const bwInc = typeof job.bwSheets === 'number' ? job.bwSheets : (job.colorMode === 'B&W' ? job.totalPages : 0);
-      const costInc = computeDueBdt(colorInc, bwInc);
+      const costInc = typeof job.costBdt === 'number' ? job.costBdt : computeDueBdt(colorInc, bwInc);
 
       await db.collection('stats').doc('summary').set({
         totalJobs: inc(1),
@@ -841,12 +859,30 @@ app.post('/api/print-file', requireGoogleUser, upload.fields([{ name: 'file', ma
   const pageOrder = req.body.pageOrder === 'normal' ? 'normal' : 'reverse';
   const pageMode = req.body.pageMode || 'all';
   const customPages = String(req.body.customPages || '').replace(/[^0-9,\-]/g, '');
-  const quality = ['PLAIN_NORMAL', 'PLAIN_HIGH', 'PMPHOTO_NORMAL'].includes(req.body.quality)
+  let quality = ['PLAIN_NORMAL', 'PLAIN_HIGH'].includes(req.body.quality)
     ? req.body.quality
     : 'PLAIN_NORMAL';
   const layoutPreset = ['none', 'id_card', 'passport_4', 'passport_8'].includes(req.body.layoutPreset)
     ? req.body.layoutPreset
     : 'none';
+  const isPassportPreset = (layoutPreset === 'passport_4' || layoutPreset === 'passport_8');
+  const passportMedia = (isPassportPreset && req.body.passportMedia === 'PMPHOTO_NORMAL')
+    ? 'PMPHOTO_NORMAL'
+    : 'PLAIN_NORMAL';
+  if (isPassportPreset && passportMedia === 'PMPHOTO_NORMAL') {
+    quality = 'PMPHOTO_NORMAL';
+  }
+
+  if (OFFICE_EXTS.has(ext)) {
+    const convertedPdf = await convertOfficeToPdf(inputPath, JOBS_DIR);
+    if (!convertedPdf) {
+      cleanup();
+      return res.status(500).json({ error: 'Could not convert Office document to PDF.' });
+    }
+    extraCleanup.push(inputPath);
+    inputPath = convertedPdf;
+    ext = '.pdf';
+  }
 
   let activePageMode = pageMode;
   let activeCustomPages = customPages;
@@ -902,11 +938,17 @@ app.post('/api/print-file', requireGoogleUser, upload.fields([{ name: 'file', ma
   const bwSheetsPerCopy = sheetIsColor.length - colorSheetsPerCopy;
   const colorSheets = colorSheetsPerCopy * copies;
   const bwSheets = bwSheetsPerCopy * copies;
-  const effectiveColorMode = (colorSheets > 0 && bwSheets > 0)
-    ? `Mixed (${colorSheets}C+${bwSheets}B)`
-    : (colorSheets > 0 ? 'Color' : 'B&W');
-  const effectiveInk = (colorSheets === 0) ? 'MONO' : ink;
-  const costBdt = computeDueBdt(colorSheets, bwSheets);
+  const isPhotoGlossyPassport = (isPassportPreset && passportMedia === 'PMPHOTO_NORMAL');
+  const photoCountPerSheet = layoutPreset === 'passport_8' ? 8 : (layoutPreset === 'passport_4' ? 4 : 0);
+  const effectiveColorMode = isPhotoGlossyPassport
+    ? `Photo Glossy (${photoCountPerSheet}×)`
+    : ((colorSheets > 0 && bwSheets > 0)
+        ? `Mixed (${colorSheets}C+${bwSheets}B)`
+        : (colorSheets > 0 ? 'Color' : 'B&W'));
+  const effectiveInk = isPhotoGlossyPassport ? 'COLOR' : ((colorSheets === 0) ? 'MONO' : ink);
+  const costBdt = isPhotoGlossyPassport
+    ? (photoCountPerSheet * copies * 6)
+    : computeDueBdt(colorSheets, bwSheets);
   const devInfo = parseDeviceInfo(req);
 
   const baseCupsOpts = [

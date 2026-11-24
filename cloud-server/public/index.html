@@ -293,8 +293,8 @@
         <div class="section-title">1. Document &amp; Live Sheet Preview</div>
         <div class="dropzone" id="dropzone" onclick="document.getElementById('file').click()">
           <div style="font-weight: 600; font-size: 14px;">Tap or drag &amp; drop a Document</div>
-          <div class="file-meta" id="fileMeta">Supports PDF, PNG, JPG (max 25 MB)</div>
-          <input id="file" type="file" accept=".pdf,.png,.jpg,.jpeg,application/pdf,image/*" onchange="handleFileSelect()" />
+          <div class="file-meta" id="fileMeta">Supports PDF, Word, PPT, Excel, PNG, JPG (max 25 MB)</div>
+          <input id="file" type="file" accept=".pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.odt,.ods,.odp,.txt,.rtf,.png,.jpg,.jpeg,application/pdf,image/*" onchange="handleFileSelect()" />
         </div>
 
         <div class="preview-header">
@@ -341,7 +341,6 @@
             <select id="quality">
               <option value="PLAIN_NORMAL">Standard (Fast)</option>
               <option value="PLAIN_HIGH">High</option>
-              <option value="PMPHOTO_NORMAL">Photo Glossy</option>
             </select>
           </div>
           <div>
@@ -379,6 +378,13 @@
           <div id="idBackWrap" class="hidden">
             <label for="backFile">Back Side of ID Card (Optional — PNG/JPG)</label>
             <input id="backFile" type="file" accept=".png,.jpg,.jpeg,.pdf,image/*,application/pdf" onchange="handleBackSelect()" />
+          </div>
+          <div id="passportPaperWrap" class="hidden">
+            <label for="passportMedia">Passport Paper Type</label>
+            <select id="passportMedia" onchange="renderPreview()">
+              <option value="PLAIN_NORMAL">Plain Paper (Standard Rate)</option>
+              <option value="PMPHOTO_NORMAL">Photo Glossy (6 BDT / photo)</option>
+            </select>
           </div>
           <label for="pageOrder">Print Order</label>
           <select id="pageOrder" onchange="renderPreview()">
@@ -726,6 +732,7 @@
     function togglePresetBack() {
       const preset = document.getElementById('layoutPreset').value;
       document.getElementById('idBackWrap').classList.toggle('hidden', preset !== 'id_card');
+      document.getElementById('passportPaperWrap').classList.toggle('hidden', preset !== 'passport_4' && preset !== 'passport_8');
     }
 
     function handleBackSelect() {
@@ -860,6 +867,16 @@
       const copies = Math.max(1, Math.min(20, parseInt(document.getElementById('copies').value || '1', 10) || 1));
       const sheetsPerCopy = preset !== 'none' ? 1 : Math.ceil(count / nUp);
       const sheets = sheetsPerCopy * copies;
+      const isPassport = (preset === 'passport_4' || preset === 'passport_8');
+      const passportMedia = document.getElementById('passportMedia').value;
+      if (isPassport && passportMedia === 'PMPHOTO_NORMAL') {
+        const photosPerSheet = preset === 'passport_8' ? 8 : 4;
+        const totalPhotos = photosPerSheet * copies;
+        const cost = totalPhotos * 6;
+        document.getElementById('estText').textContent = `${totalPhotos} Photo Glossy copy(s) × 6 BDT (${sheets} sheet)`;
+        document.getElementById('estCost').textContent = `${cost} BDT`;
+        return;
+      }
       const isColor = document.getElementById('color').value !== 'Gray';
       if (isColor && detectedColorSheets !== null && detectedBwSheets !== null && (detectedColorSheets + detectedBwSheets) === sheetsPerCopy) {
         const cSheets = detectedColorSheets * copies;
@@ -887,7 +904,7 @@
       detectedBwSheets = null;
 
       if (!file) {
-        meta.textContent = 'Supports PDF, PNG, JPG (max 25 MB)';
+        meta.textContent = 'Supports PDF, Word, PPT, Excel, PNG, JPG (max 25 MB)';
         box.innerHTML = '<div class="preview-empty">Select or drop a Document above to preview here.</div>';
         updateEstimate(0);
         return;
@@ -911,7 +928,10 @@
         totalLoadedPages = 1;
         await renderPreview();
       } else {
-        box.innerHTML = `<div class="preview-empty">Selected: ${file.name}</div>`;
+        totalLoadedPages = 1;
+        document.getElementById('previewSummary').textContent = 'Office document ready';
+        box.innerHTML = `<div class="preview-empty"><b>${file.name}</b><br><br>Word / PowerPoint / Excel files are converted to PDF automatically on the server before printing.</div>`;
+        updateEstimate(1);
       }
     }
 
@@ -1277,6 +1297,7 @@
       form.append('copies', document.getElementById('copies').value);
       const layoutPreset = document.getElementById('layoutPreset').value;
       form.append('layoutPreset', layoutPreset);
+      form.append('passportMedia', document.getElementById('passportMedia').value);
       if (layoutPreset === 'id_card') {
         const bf = document.getElementById('backFile').files[0];
         if (bf) form.append('backFile', bf);
