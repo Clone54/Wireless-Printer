@@ -71,11 +71,79 @@ function sendAdminTelegram(job, reasonLabel = 'Approval Required') {
   });
 }
 
+
+function downloadTelegramFile(fileId, destPath) {
+  const botToken = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+  if (!botToken) return Promise.resolve(false);
+  return telegramApi('getFile', { file_id: fileId }).then((info) => {
+    if (!info || !info.ok || !info.result || !info.result.file_path) return false;
+    const fileUrl = `https://api.telegram.org/file/bot${botToken}/${info.result.file_path}`;
+    return new Promise((resolve) => {
+      https.get(fileUrl, { timeout: 25000 }, (res) => {
+        if (res.statusCode !== 200) { resolve(false); return; }
+        const ws = fs.createWriteStream(destPath);
+        res.pipe(ws);
+        ws.on('finish', () => ws.close(() => resolve(true)));
+        ws.on('error', () => resolve(false));
+      }).on('error', () => resolve(false));
+    });
+  });
+}
+
+let espWasOnline = false;
+let offlineAlertSent = false;
+setInterval(() => {
+  if (lastEspSeen === 0) return;
+  const isOnline = (Date.now() - lastEspSeen) < 15000;
+  if (isOnline) {
+    espWasOnline = true;
+    if (offlineAlertSent) {
+      offlineAlertSent = false;
+      const botToken = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+      const chatId = (process.env.TELEGRAM_CHAT_ID || '').trim();
+      if (botToken && chatId) {
+        telegramApi('sendMessage', { chat_id: chatId, text: '🟢 ESP32-S3 Print Server is back ONLINE!' }).catch(() => {});
+      }
+    }
+  } else if (espWasOnline && !offlineAlertSent && (Date.now() - lastEspSeen) > 120000) {
+    offlineAlertSent = true;
+    const botToken = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+    const chatId = (process.env.TELEGRAM_CHAT_ID || '').trim();
+    if (botToken && chatId) {
+      telegramApi('sendMessage', { chat_id: chatId, text: '⚠️ Alert: ESP32-S3 Print Server has been OFFLINE for 2+ minutes!' }).catch(() => {});
+    }
+  }
+}, 15000);
+
+function sendTelegramFailAlert(job) {
+  const botToken = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+  const chatId = (process.env.TELEGRAM_CHAT_ID || '').trim();
+  if (!botToken || !chatId) return;
+  telegramApi('sendMessage', {
+    chat_id: chatId,
+    text: `❌ Print Failed: "${job.name}"\n👤 User: ${job.userEmail || '—'}\n💰 Cost: ${job.costBdt || 0} BDT`
+  }).catch(() => {});
+}
+
 let tgPollOffset = 0;
 function startTelegramPoller() {
   const botToken = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
   const chatId = (process.env.TELEGRAM_CHAT_ID || '').trim();
   if (!botToken || !chatId) return;
+
+  telegramApi('setMyCommands', {
+    commands: [
+      { command: 'status', description: 'Printer, Wi-Fi & queue info' },
+      { command: 'pause', description: 'Pause print queue' },
+      { command: 'resume', description: 'Resume print queue' },
+      { command: 'dues', description: 'List unpaid user balances' },
+      { command: 'reset', description: 'Clear user due (/reset email)' },
+      { command: 'authorize', description: 'Allow direct print (/authorize email)' },
+      { command: 'revoke', description: 'Require approval (/revoke email)' },
+      { command: 'rates', description: 'Set rates (/rates color bw)' },
+      { command: 'help', description: 'Show all bot commands' }
+    ]
+  }).catch(() => {});
 
   setInterval(async () => {
     try {
@@ -84,8 +152,88 @@ function startTelegramPoller() {
       for (const upd of res.result) {
         tgPollOffset = upd.update_id + 1;
 
-        if (upd.message && upd.message.text && upd.message.chat && String(upd.message.chat.id) === chatId) {
-          const cmd = String(upd.message.text).trim().split(/\s+/)[0].toLowerCase().split('@')[0];
+        if (upd.message && upd.message.chat && String(upd.message.chat.id) === chatId) {
+          // A. Direct file/photo printing from Telegram
+          if (upd.message.document || (Array.isArray(upd.message.photo) && upd.message.photo.length > 0)) {
+            const doc = upd.message.document;
+            const fileId = doc ? doc.file_id : upd.message.photo[upd.message.photo.length - 1].file_id;
+            const origName = doc && doc.file_name ? doc.file_name : `telegram_photo_${Date.now()}.jpg`;
+            let ext = path.extname(origName).toLowerCase() || '.jpg';
+            const jobId = crypto.randomBytes(6).toString('hex');
+            let localPath = path.join(UPLOADS_DIR, `tg_${jobId}${ext}`);
+            await telegramApi('sendMessage', { chat_id: chatId, text: `⏳ Processing "${origName}"...` });
+            const dlOk = await downloadTelegramFile(fileId, localPath);
+            if (!dlOk || !fs.existsSync(localPath)) {
+              await telegramApi('sendMessage', { chat_id: chatId, text: `❌ Failed to download "${origName}" from Telegram.` });
+              continue;
+            }
+            const cap = String(upd.message.caption || '').toLowerCase();
+            const isGray = /\b(bw|b&w|gray|grey|mono)\b/.test(cap);
+            const orientation = /\blandscape\b/.test(cap) ? 'landscape' : 'portrait';
+            const paper = /\ba5\b/.test(cap) ? 'A5' : (/\bletter\b/.test(cap) ? 'Letter' : 'A4');
+            const copyMatch = cap.match(/(\d+)\s*cop/);
+            const copies = copyMatch ? Math.max(1, Math.min(20, parseInt(copyMatch[1], 10) || 1)) : 1;
+
+            const extraTmp = [];
+            try {
+              if (OFFICE_EXTS.has(ext)) {
+                const convPdf = await convertOfficeToPdf(localPath, JOBS_DIR);
+                if (!convPdf) throw new Error('Office conversion failed');
+                extraTmp.push(localPath);
+                localPath = convPdf;
+                ext = '.pdf';
+              }
+              const pageList = await getSelectedPageList(localPath, ext, 'all', '');
+              const sheetsPerCopy = pageList.length;
+              const totalPages = sheetsPerCopy * copies;
+              let sheetIsColor = pageList.map(() => !isGray);
+              if (!isGray) {
+                if (ext === '.pdf') {
+                  const pcm = await detectPdfPageColors(localPath, Math.max(...pageList, 1));
+                  sheetIsColor = pageList.map(p => pcm[p] !== false);
+                } else {
+                  const ic = await detectImageIsColor(localPath);
+                  sheetIsColor = pageList.map(() => ic);
+                }
+              }
+              const colorSheets = sheetIsColor.filter(Boolean).length * copies;
+              const bwSheets = totalPages - colorSheets;
+              const effColorMode = (colorSheets > 0 && bwSheets > 0) ? `Mixed (${colorSheets}C+${bwSheets}B)` : (colorSheets > 0 ? 'Color' : 'B&W');
+              const effInk = colorSheets === 0 ? 'MONO' : 'COLOR';
+              const costBdt = computeDueBdt(colorSheets, bwSheets);
+              const envVars = { PPD: PPD_PATH, PRINTER: 'epson_l3210', CUPS_SERVERROOT: '/etc/cups' };
+              const cupsOpts = ['-o', `PageSize=${paper}`, '-o', `media=${paper}`, '-o', `Ink=${effInk}`, '-o', 'MediaType=PLAIN_NORMAL', '-o', 'fit-to-page', '-o', 'outputorder=reverse'];
+              if (orientation === 'landscape') cupsOpts.push('-o', 'landscape');
+              const optsStr = `PageSize=${paper} media=${paper} Ink=${effInk} MediaType=PLAIN_NORMAL fit-to-page`;
+              const rBuf = await renderEscprBuffer({ inputPath: localPath, ext, originalName: origName, paper, cupsOpts, copies, optsStr, envVars });
+              if (!isValidEscpr(rBuf.finalBuf)) throw new Error('ESC/P-R conversion failed');
+              const outPath = path.join(JOBS_DIR, `${jobId}.prn`);
+              fs.writeFileSync(outPath, rBuf.finalBuf);
+              const job = {
+                id: jobId, uid: 'admin_telegram', userEmail: ADMIN_EMAIL, userName: 'Admin (Telegram)',
+                name: origName, source: 'Telegram', device: 'Telegram Bot', ip: 'telegram',
+                colorMode: effColorMode, colorSheets, bwSheets, pagesPerCopy: sheetsPerCopy, pagesPerSheet: 1,
+                copies, totalPages, costBdt, paper, orientation, quality: 'PLAIN_NORMAL',
+                pageMode: 'all', customPages: '', size: rBuf.finalBuf.length,
+                chunks: [{ index: 0, filePath: outPath, size: rBuf.finalBuf.length }], currentChunk: 0,
+                status: 'queued', createdAt: new Date().toISOString(), filePath: outPath
+              };
+              jobs.push(job);
+              await saveJobToFirestore(job);
+              await telegramApi('sendMessage', { chat_id: chatId, text: `✅ Queued "${origName}"\n📄 ${totalPages} sheet(s) • ${effColorMode} • ${costBdt} BDT` });
+            } catch (err) {
+              await telegramApi('sendMessage', { chat_id: chatId, text: `❌ Could not print "${origName}": ${err.message}` });
+            } finally {
+              if (fs.existsSync(localPath)) fs.unlink(localPath, () => {});
+              for (const tf of extraTmp) { if (fs.existsSync(tf)) fs.unlink(tf, () => {}); }
+            }
+            continue;
+          }
+
+          if (!upd.message.text) continue;
+          const parts = String(upd.message.text).trim().split(/\s+/);
+          const cmd = parts[0].toLowerCase().split('@')[0];
+
           if (cmd === '/status' || cmd === '/start') {
             const espOnline = (Date.now() - lastEspSeen) < 15000;
             const printingJob = jobs.find(j => j.status === 'printing');
@@ -98,11 +246,12 @@ function startTelegramPoller() {
               `• ESP32-S3: ${espOnline ? `🟢 Online (${espPrinterStatus})` : '🟡 Offline'}`,
               `• Wi-Fi: ${espOnline && espWifiSsid ? espWifiSsid : '—'}`,
               `• Queue: ${queuePaused ? '⏸️ PAUSED' : '▶️ ACTIVE'}`,
+              `• Rates: Color ${rateColorBdt} BDT • B&W ${rateBwBdt} BDT`,
               `• Printing Now: ${printingJob ? `${printingJob.name} (${printingJob.progress || 0}%)` : 'None'}`,
               `• Queued: ${queuedJobs.length} job(s) (${queuedPages} page(s))`,
               `• Awaiting Approval: ${awaitingJobs.length} job(s)`,
               '',
-              'Commands: /status • /pause • /resume'
+              'Send /help for all commands or send any PDF/Word/Photo to print!'
             ].join('\n');
             await telegramApi('sendMessage', { chat_id: chatId, text: reply });
           } else if (cmd === '/pause') {
@@ -112,10 +261,7 @@ function startTelegramPoller() {
                 paused: true, updatedBy: 'telegram', updatedAt: new Date().toISOString()
               }, { merge: true }).catch(() => {});
             }
-            await telegramApi('sendMessage', {
-              chat_id: chatId,
-              text: '⏸️ Print queue PAUSED. Users can still upload; send /resume when ready.'
-            });
+            await telegramApi('sendMessage', { chat_id: chatId, text: '⏸️ Print queue PAUSED. Send /resume when ready.' });
           } else if (cmd === '/resume') {
             queuePaused = false;
             if (db) {
@@ -123,14 +269,83 @@ function startTelegramPoller() {
                 paused: false, updatedBy: 'telegram', updatedAt: new Date().toISOString()
               }, { merge: true }).catch(() => {});
             }
-            await telegramApi('sendMessage', {
-              chat_id: chatId,
-              text: '▶️ Print queue RESUMED! Queued jobs will start printing now.'
-            });
+            await telegramApi('sendMessage', { chat_id: chatId, text: '▶️ Print queue RESUMED! Queued jobs will start printing now.' });
+          } else if (cmd === '/dues') {
+            await ensureDbCacheLoaded();
+            const list = Object.values(dbCache.users)
+              .map(u => ({ email: u.email || u.uid, due: resolveUserDueBdt(u) }))
+              .filter(x => x.due > 0)
+              .sort((a, b) => b.due - a.due);
+            const total = list.reduce((a, x) => a + x.due, 0);
+            const lines = list.length
+              ? list.map(x => `• ${x.email}: ${x.due} BDT`)
+              : ['All users are paid up (0 BDT due).'];
+            await telegramApi('sendMessage', { chat_id: chatId, text: `💰 Unpaid Dues (Total: ${total} BDT)\n\n${lines.join('\n')}` });
+          } else if (cmd === '/reset') {
+            await ensureDbCacheLoaded();
+            const targetEmail = (parts[1] || '').toLowerCase();
+            const u = Object.values(dbCache.users).find(x => (x.email || '').toLowerCase() === targetEmail);
+            if (!u) {
+              await telegramApi('sendMessage', { chat_id: chatId, text: 'Usage: /reset user@gmail.com (user not found)' });
+            } else {
+              memoryUserDues[u.uid] = { dueColorPages: 0, dueBwPages: 0 };
+              u.dueColorPages = 0; u.dueBwPages = 0; u.dueAmountBdt = 0; u.dueResetFlag = true;
+              if (db) {
+                db.collection('users').doc(u.uid).set({
+                  dueColorPages: 0, dueBwPages: 0, dueAmountBdt: 0, dueResetFlag: true,
+                  lastPaidAt: new Date().toISOString(), lastPaidBy: 'telegram'
+                }, { merge: true }).catch(() => {});
+              }
+              await telegramApi('sendMessage', { chat_id: chatId, text: `✅ Reset ${u.email}'s due to 0 BDT.` });
+            }
+          } else if (cmd === '/authorize' || cmd === '/revoke') {
+            await ensureDbCacheLoaded();
+            const authVal = (cmd === '/authorize');
+            const targetEmail = (parts[1] || '').toLowerCase();
+            const u = Object.values(dbCache.users).find(x => (x.email || '').toLowerCase() === targetEmail);
+            if (!u) {
+              await telegramApi('sendMessage', { chat_id: chatId, text: `Usage: ${cmd} user@gmail.com (user not found)` });
+            } else {
+              u.authorized = authVal;
+              if (db) {
+                db.collection('users').doc(u.uid).set({
+                  authorized: authVal, authorizedBy: 'telegram', authorizedAt: new Date().toISOString()
+                }, { merge: true }).catch(() => {});
+              }
+              await telegramApi('sendMessage', { chat_id: chatId, text: `${authVal ? '✅ Authorized' : '🔒 Revoked'} ${u.email}` });
+            }
+          } else if (cmd === '/rates') {
+            const c = parseFloat(parts[1]);
+            const b = parseFloat(parts[2]);
+            if (!Number.isFinite(c) || !Number.isFinite(b) || c < 0 || b < 0 || c > 500 || b > 500) {
+              await telegramApi('sendMessage', { chat_id: chatId, text: `Usage: /rates <color> <bw>\nExample: /rates 4 3\nCurrent: Color=${rateColorBdt}, B&W=${rateBwBdt}` });
+            } else {
+              rateColorBdt = Math.round(c * 100) / 100;
+              rateBwBdt = Math.round(b * 100) / 100;
+              dbCache.rates = { colorBdt: rateColorBdt, bwBdt: rateBwBdt };
+              if (db) {
+                db.collection('settings').doc('pricing').set({
+                  colorBdt: rateColorBdt, bwBdt: rateBwBdt, updatedBy: 'telegram', updatedAt: new Date().toISOString()
+                }, { merge: true }).catch(() => {});
+              }
+              await telegramApi('sendMessage', { chat_id: chatId, text: `✅ Rates updated: Color = ${rateColorBdt} BDT, B&W = ${rateBwBdt} BDT` });
+            }
           } else if (cmd === '/help') {
             await telegramApi('sendMessage', {
               chat_id: chatId,
-              text: 'Available commands:\n/status — Printer, Wi-Fi & queue info\n/pause — Pause print queue\n/resume — Resume print queue'
+              text: [
+                '🤖 Admin Bot Commands:',
+                '/status — Printer, Wi-Fi & queue info',
+                '/pause — Pause print queue',
+                '/resume — Resume print queue',
+                '/dues — List unpaid user balances',
+                '/reset <email> — Clear a user\'s due',
+                '/authorize <email> — Allow direct print',
+                '/revoke <email> — Require approval',
+                '/rates <color> <bw> — Update BDT rates',
+                '',
+                '📄 Send any PDF, Word, or Photo (with optional caption like "bw 2 copies landscape") to print directly!'
+              ].join('\n')
             });
           }
           continue;
@@ -1506,6 +1721,7 @@ function recoverStuckJobs() {
         j.status = 'failed';
         cleanupJobFiles(j);
         updateJobStatusInFirestore(j, false);
+        sendTelegramFailAlert(j);
         console.log(`[Queue] Marked stalled job ${j.id} as failed`);
       }
     }
@@ -1623,6 +1839,7 @@ app.post('/api/esp/job/:id/done', requireDeviceToken, express.json(), async (req
   job.progress = ok ? 100 : (job.progress || 0);
   cleanupJobFiles(job);
   await updateJobStatusInFirestore(job, ok);
+  if (!ok) sendTelegramFailAlert(job);
   res.json({ ok: true });
 });
 
